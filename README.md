@@ -30,7 +30,8 @@ In a sections view it takes half the width and two rows, the same footprint as a
 1. Settings → **Marketplace**. The first time, accept the community-code notice.
 2. **Add from link** → `https://github.com/danguilherme/ha-cards`. Custom repositories need a one-time
    GitHub device sign-in (read-only, public data).
-3. Open **ha-cards** → **Install**. The dashboard resource (JavaScript module) is registered for you.
+3. Open **ha-cards** → **Install**. The resource `/local/community/ha-cards/ha-cards.js?v=…` (JavaScript
+   module) is registered for you.
 4. If a card says "Custom element doesn't exist", refresh the browser. In the Companion app, reset
    the frontend cache (App settings → Companion app → Troubleshooting).
 
