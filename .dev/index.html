@@ -1,0 +1,62 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>ha-cards preview</title>
+    <style>
+      body { --card-background-color: #fff; --ha-card-border-radius: 22px; --secondary-text-color: #6e6e73; margin: 0; padding: 16px; background: #f2f2f7; font-family: -apple-system, Inter, system-ui, sans-serif; }
+      .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 170px)); grid-auto-rows: 120px; gap: 10px; }
+      #log { margin-top: 16px; font: 12px ui-monospace, monospace; color: #444; white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <div class="grid" id="grid"></div>
+    <div id="log"></div>
+    <script type="module">
+      // Local preview with a mocked `hass` — no HA needed. `yarn dev`, then open http://localhost:5173/preview/
+      // Stand-ins for HA's own elements:
+      customElements.define("ha-card", class extends HTMLElement {
+        connectedCallback() { this.style.display = "block"; this.style.borderRadius = "22px"; }
+      });
+      customElements.define("ha-state-icon", class extends HTMLElement { connectedCallback() { this.textContent = "○"; } });
+      customElements.define("ha-icon", class extends HTMLElement { connectedCallback() { this.textContent = "●"; } });
+
+      const log = (m) => (document.getElementById("log").textContent += m + "\n");
+      const states = {
+        "light.ceiling": { entity_id: "light.ceiling", state: "on", attributes: { friendly_name: "Ceiling", brightness: 204, rgb_color: [255, 190, 110], supported_color_modes: ["color_temp"] } },
+        "light.lamp": { entity_id: "light.lamp", state: "on", attributes: { friendly_name: "Lamp", brightness: 115, rgb_color: [180, 140, 255], supported_color_modes: ["hs"] } },
+        "light.filament": { entity_id: "light.filament", state: "off", attributes: { friendly_name: "Filament", supported_color_modes: ["brightness"] } },
+        "light.plug": { entity_id: "light.plug", state: "unavailable", attributes: { friendly_name: "Red light", supported_color_modes: ["onoff"] } },
+      };
+      const cards = [];
+      const makeHass = () => ({
+        states: { ...states },
+        async callService(domain, service, data) {
+          log(`${domain}.${service} ${JSON.stringify(data)}`);
+          const e = states[data.entity_id];
+          const on = service === "turn_on" || (service === "toggle" && e.state !== "on");
+          states[data.entity_id] = {
+            ...e,
+            state: on ? "on" : "off",
+            attributes: { ...e.attributes, ...(data.brightness_pct ? { brightness: Math.round(data.brightness_pct * 2.55) } : {}) },
+          };
+          const h = makeHass();
+          cards.forEach((c) => (c.hass = h));
+        },
+      });
+      window.addEventListener("hass-more-info", (e) => log(`more-info ${e.detail.entityId}`));
+
+      await import("/ha-cards.js");
+      const hass = makeHass();
+      for (const entity of Object.keys(states)) {
+        const card = document.createElement("dg-light-tile");
+        card.setConfig({ type: "custom:dg-light-tile", entity });
+        card.hass = hass;
+        cards.push(card);
+        document.getElementById("grid").appendChild(card);
+      }
+      log(`loaded: ${window.customCards.map((c) => c.type).join(", ")}`);
+    </script>
+  </body>
+</html>

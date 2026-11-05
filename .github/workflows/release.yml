@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Enable Corepack (Yarn from packageManager)
+        run: corepack enable
+
+      - name: Check tag matches package.json version
+        run: |
+          pkg="v$(node -p 'require("./package.json").version')"
+          [ "$pkg" = "$GITHUB_REF_NAME" ] || { echo "::error::tag $GITHUB_REF_NAME != package.json $pkg"; exit 1; }
+
+      - run: yarn install --immutable
+
+      - name: Build
+        run: yarn build
+        env:
+          NODE_ENV: production
+
+      - name: Create release with the bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.js --title "$GITHUB_REF_NAME" --generate-notes --verify-tag

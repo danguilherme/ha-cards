@@ -1,0 +1,23 @@
+{
+  "packageManager": "yarn@4.18.1+sha512.b2e1e7524f654f2749d32b4ebcb4622473cb5bcbc485df2007e12a154e50162a4d795526768bc5f5b8f81717bfd79deb2472813d86fb5ae2eb551fa9c872b08f",
+  "name": "ha-cards",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Custom Home Assistant dashboard cards (Lit + TypeScript), distributed via HACS",
+  "license": "MIT",
+  "scripts": {
+    "dev": "rspack serve",
+    "build": "tsc --noEmit && NODE_ENV=production rspack build --mode production",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "lit": "^3.3.3"
+  },
+  "devDependencies": {
+    "@rspack/cli": "^2.3.1",
+    "@rspack/core": "^2.3.1",
+    "@rspack/dev-server": "^2.2.2",
+    "typescript": "^7.0.2"
+  }
+}
