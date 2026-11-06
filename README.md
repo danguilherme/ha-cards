@@ -33,16 +33,18 @@ The home as a floor plan, made for phones.
 - **Rooms glow with their lights**: every positioned bulb that's on glows in its own colour and
   brightness, clipped to its room, so a room with a warm ceiling light and a purple lamp shows both.
   Media players, sensors and the vacuum show as icons; the vacuum moves to the room it's cleaning.
-- **Tap a room** for a sheet with everything assigned to its HA area (directly or through the device):
-  sensor chips, a vacuum card with "Clean this room" (`vacuum.clean_area`), the room's light group with
-  a slider plus a `dg-light-tile` per bulb, scenes, media players and other devices (switches, covers,
-  fans…). Hidden entities, config/diagnostic entities, light groups and the vacuum's own entities are
-  left out.
-- **Hold a room** to toggle its light group.
-- **Arrange mode** (pencil button on the map): drag dots and icons to where the devices really are, or
-  pick an unplaced device and tap the map. **Save** stores the layout per HA user
-  (`frontend/set_user_data`), so it follows you across devices right away. **Copy as YAML** gives a
-  `positions:` block to paste into the card config; saved positions win over YAML until you **Reset**.
+- **Tap a room** to zoom into it. Its devices sit on the map where they really are, with their names:
+  tap a light (or switch, fan…) to toggle it, hold any of them for its details. Below the map is
+  everything assigned to the room's HA area (directly or through the device): sensor chips, the room's
+  light group with a slider plus a `dg-light-tile` per bulb, scenes, a vacuum card with "Clean this
+  room" (`vacuum.clean_area`), media players and other devices. Hidden entities, config/diagnostic
+  entities, light groups and the vacuum's own entities are left out. Back (or the phone's Back) zooms out.
+- **Hold a room** on the whole-home map to toggle its light group.
+- **Edit** (in a zoomed room): drag the room's devices to where they really are and add the ones not on
+  the map yet. Every change is saved as you make it, per HA user (`frontend/set_user_data`), so it
+  follows you across devices; **Cancel** puts back what you had when you started editing. **Copy
+  positions for the dashboard YAML** gives a `positions:` block for the card config; saved positions win
+  over YAML until you **Reset all rooms to defaults**.
 
 ```yaml
 type: custom:dg-floor-plan
@@ -61,7 +63,7 @@ rooms:
     name: Living room              # optional, defaults to the area name
     shape: [[37, 37], [485, 37], [485, 435], [37, 435]]   # polygon, plan units
     label: [261, 270]              # optional, defaults to the shape's centre
-    light: light.all_living_room_lights  # optional: hold to toggle, slider in the sheet
+    light: light.all_living_room_lights  # optional: hold to toggle, slider in the room view
     clean: true                    # optional: show "Clean this room" (vacuum.clean_area)
     vacuum_room: Living room       # optional: name in vacuum_room_sensor, if different
     exclude: [media_player.old_tv] # optional

@@ -77,8 +77,9 @@ const isOff = (s?: HassEntity) => !s || ["off", "unavailable", "unknown", "idle"
 
 /**
  * Floor plan of the home: quick actions on top, rooms tinted by their lights (each bulb glows in its own
- * colour at its position), tap a room for a sheet with everything in that area, hold a room to toggle its
- * light group. An arrange mode lets you drag lights and devices to where they really are.
+ * colour at its position). Tap a room to zoom into it: its devices sit on the map where they are (tap to
+ * toggle, hold for details) with everything else in the area below. Hold a room to toggle its light group.
+ * Each room has an Edit mode to drag its devices to where they really are; changes save as you go.
  */
 export class FloorPlanCard extends LitElement {
   static properties = {
@@ -109,6 +110,9 @@ export class FloorPlanCard extends LitElement {
   private _loadedLayout = false;
   private _hold?: { timer: number; fired: boolean };
   private _dragFrom?: { x: number; y: number; moved: boolean };
+  /** Saved positions when editing started, so Cancel can put them back. `null` = nothing was saved. */
+  private _snapshot?: Record<string, Point | null> | null;
+  private _ctlHold?: { timer: number; fired: boolean };
 
   constructor() {
     super();
@@ -147,6 +151,8 @@ export class FloorPlanCard extends LitElement {
     if (!this._historyPushed || (history.state as Record<string, unknown> | null)?.[HISTORY_KEY]) return;
     this._historyPushed = false;
     this._room = undefined;
+    this._arrange = false;
+    this._selected = undefined;
   };
 
   connectedCallback(): void {
@@ -173,7 +179,10 @@ export class FloorPlanCard extends LitElement {
   }
 
   protected updated(changed: Map<PropertyKey, unknown>): void {
-    if (changed.has("_room")) this._syncHistory(!!changed.get("_room"));
+    if (changed.has("_room")) {
+      this._syncHistory(!!changed.get("_room"));
+      if (this._room && !changed.get("_room")) this.renderRoot.querySelector("ha-card")?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }
     if (!this._loadedLayout && this.hass?.callWS) {
       this._loadedLayout = true;
       this.hass
@@ -309,7 +318,7 @@ export class FloorPlanCard extends LitElement {
       this._mapDown(ev);
       return;
     }
-    if (ev.button !== 0) return;
+    if (ev.button !== 0 || this._room) return;
     const timer = window.setTimeout(() => {
       if (!this._hold) return;
       this._hold.fired = true;
@@ -352,9 +361,27 @@ export class FloorPlanCard extends LitElement {
     return [Math.min(w, Math.max(0, x)), Math.min(h, Math.max(0, y))];
   }
 
-  private _mapDown(ev: PointerEvent): void {
-    // Tapping empty map in arrange mode just clears the selection.
+  private _mapDown(_ev: PointerEvent): void {
+    // Tapping empty map while editing just clears the selection.
     if (this._arrange) this._selected = undefined;
+  }
+
+  /** Point-in-polygon (ray casting), plan units. */
+  private _inside([x, y]: Point, shape: Point[]): boolean {
+    let inside = false;
+    for (let i = 0, j = shape.length - 1; i < shape.length; j = i++) {
+      const [xi, yi] = shape[i];
+      const [xj, yj] = shape[j];
+      if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
+    }
+    return inside;
+  }
+
+  /** In the room if it sits inside the room's outline, or (when not placed) belongs to the room's area. */
+  private _inRoom(id: string, room: RoomConfig): boolean {
+    const p = this._positions[id];
+    if (p) return this._inside(p, room.shape) || (id === this._dragging);
+    return this._areaOf(id) === room.area;
   }
 
   private _dragStart(ev: PointerEvent, id: string): void {
@@ -380,8 +407,10 @@ export class FloorPlanCard extends LitElement {
   }
 
   private _dragEnd(): void {
+    const moved = this._dragFrom?.moved;
     this._dragging = undefined;
     this._dragFrom = undefined;
+    if (moved) void this._persist();
   }
 
   private _placeable(): { id: string; name: string; room: string }[] {
@@ -406,32 +435,41 @@ export class FloorPlanCard extends LitElement {
     return out;
   }
 
-  /** Drops an unplaced item in the middle of its room and selects it, so the next move is a drag. */
-  private _add(item: { id: string; room: string }): void {
-    const room = this._config!.rooms.find((r) => this._roomName(r) === item.room);
+  /** Drops an unplaced item in the middle of the room and selects it, so the next move is a drag. */
+  private _add(id: string, room: RoomConfig): void {
     const [w, h] = this._config!.size;
-    const p = room ? (room.label ?? this._centroid(room.shape)) : ([w / 2, h / 2] as Point);
     const unit = Math.max(w, h) / 100;
-    this._draft = { ...(this._draft ?? {}), [item.id]: [Math.round(p[0]), Math.round(p[1] + 7 * unit)] };
-    this._selected = item.id;
-    this.renderRoot.querySelector(".map")?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    const p = room.label ?? this._centroid(room.shape);
+    this._draft = { ...(this._draft ?? {}), [id]: [Math.round(p[0]), Math.round(p[1] + 7 * unit)] };
+    this._selected = id;
+    void this._persist();
   }
 
   private _remove(id: string): void {
     this._draft = { ...(this._draft ?? {}), [id]: null };
     this._selected = undefined;
+    void this._persist();
   }
 
-  private get _dirty(): boolean {
-    return !!this._draft && Object.keys(this._draft).length > 0;
+  /** Every change is written straight away: nothing is lost if the page reloads or Back is pressed. */
+  private async _persist(): Promise<void> {
+    if (!this._draft || !Object.keys(this._draft).length) return;
+    const value = { ...(this._saved ?? {}), ...this._draft };
+    this._saved = value;
+    this._draft = undefined;
+    await this.hass?.callWS?.({ type: "frontend/set_user_data", key: this._layoutKey, value });
+  }
+
+  private get _changedSinceStart(): boolean {
+    return JSON.stringify(this._saved ?? null) !== JSON.stringify(this._snapshot ?? null);
   }
 
   private _enterArrange(): void {
     this._arrange = true;
-    this._room = undefined;
     this._selected = undefined;
     this._yaml = undefined;
     this._draft = undefined;
+    this._snapshot = this._saved ? { ...this._saved } : null;
   }
 
   private _exitArrange(): void {
@@ -439,13 +477,14 @@ export class FloorPlanCard extends LitElement {
     this._selected = undefined;
     this._yaml = undefined;
     this._draft = undefined;
+    this._snapshot = undefined;
   }
 
-  private async _save(): Promise<void> {
-    if (this._dirty) {
-      const value = { ...(this._saved ?? {}), ...(this._draft ?? {}) };
+  private async _cancelArrange(): Promise<void> {
+    if (this._changedSinceStart) {
+      const value = this._snapshot ?? null;
+      this._saved = value ?? undefined;
       await this.hass?.callWS?.({ type: "frontend/set_user_data", key: this._layoutKey, value });
-      this._saved = value;
     }
     this._exitArrange();
   }
@@ -456,6 +495,33 @@ export class FloorPlanCard extends LitElement {
     this._saved = undefined;
     this._draft = undefined;
     this._selected = undefined;
+  }
+
+  // --- zoomed-room controls -----------------------------------------------------------------------
+
+  private _ctlDown(ev: PointerEvent, id: string): void {
+    if (ev.button !== 0) return;
+    ev.stopPropagation();
+    const timer = window.setTimeout(() => {
+      if (!this._ctlHold) return;
+      this._ctlHold.fired = true;
+      navigator.vibrate?.(15);
+      fireMoreInfo(this, id);
+    }, HOLD_MS);
+    this._ctlHold = { timer, fired: false };
+  }
+
+  private _ctlUp(): void {
+    if (this._ctlHold) clearTimeout(this._ctlHold.timer);
+  }
+
+  private _ctlClick(s: HassEntity): void {
+    const held = this._ctlHold?.fired;
+    this._ctlHold = undefined;
+    if (held) return;
+    if (domainOf(s.entity_id) === "light") {
+      if (s.state !== "unavailable") this._call("light", "toggle", { entity_id: s.entity_id });
+    } else this._toggleEntity(s);
   }
 
   private _showYaml(): void {
@@ -483,20 +549,16 @@ export class FloorPlanCard extends LitElement {
       ...(vac ? [`${this._name(vac)} ${this._state(vac).toLowerCase()}`] : []),
     ].join(" · ");
 
+    const room = this._room ? c.rooms.find((r) => r.area === this._room) : undefined;
     return html`
-      <ha-card>
-        ${this._arrange
-          ? html`<div class="arrange-bar">
-              <button class="btn" @click=${() => this._exitArrange()}>Cancel</button>
-              <div class="arrange-title">Place devices</div>
-              <button class="btn primary" @click=${() => this._save()}>${this._dirty ? "Save" : "Done"}</button>
-            </div>`
+      <ha-card class=${room ? "zoomed" : ""}>
+        ${room
+          ? this._renderRoomBar(room)
           : html`${c.hide_summary ? nothing : html`<div class="summary">${summary}</div>`}
               ${c.quick_actions?.length ? this._renderQuick(c.quick_actions) : nothing}`}
-        ${this._renderMap()}
-        ${this._arrange ? this._renderArrange() : this._renderPills()}
+        ${this._renderMap(room)}
+        ${room ? (this._arrange ? this._renderArrange(room) : this._renderRoom(room)) : this._renderPills()}
       </ha-card>
-      ${this._room && !this._arrange ? this._renderSheet() : nothing}
     `;
   }
 
@@ -516,7 +578,7 @@ export class FloorPlanCard extends LitElement {
     </div>`;
   }
 
-  private _renderMap() {
+  private _renderMap(zoom?: RoomConfig) {
     const c = this._config!;
     const hass = this.hass!;
     const [w, h] = c.size;
@@ -541,7 +603,8 @@ export class FloorPlanCard extends LitElement {
           return svg`<circle cx=${x} cy=${y} r=${(15 + 17 * (pct / 100)) * unit} fill="url(#${gid})"></circle>`;
         });
       if (!this._arrange) glows.push(svg`<g clip-path="url(#room-${i})" pointer-events="none">${roomGlows}</g>`);
-      return svg`<polygon class="room ${this._room === room.area ? "selected" : ""} ${this._pressing === room.area ? "pressing" : ""}" points=${points}
+      const dim = zoom && zoom.area !== room.area;
+      return svg`<polygon class="room ${dim ? "dim" : ""} ${this._pressing === room.area ? "pressing" : ""}" points=${points}
         @pointerdown=${(ev: PointerEvent) => this._roomDown(ev, room)}
         @pointerup=${() => this._roomUp()}
         @click=${() => this._roomClick(room)}
@@ -551,7 +614,7 @@ export class FloorPlanCard extends LitElement {
     });
 
     const dots = Object.entries(pos)
-      .filter(([id]) => !this._arrange && domainOf(id) === "light" && hass.states[id])
+      .filter(([id]) => !zoom && domainOf(id) === "light" && hass.states[id])
       .map(([id, [x, y]]) => {
         const s = hass.states[id];
         const [r, g, b] = this._rgb(s);
@@ -563,7 +626,7 @@ export class FloorPlanCard extends LitElement {
     // Non-light devices and the vacuum as HTML icons over the SVG.
     const vacRoom = this._vacuumRoom();
     const icons = Object.entries(pos)
-      .filter(([id]) => !this._arrange && domainOf(id) !== "light" && hass.states[id])
+      .filter(([id]) => !zoom && domainOf(id) !== "light" && hass.states[id])
       .map(([id, p]) => {
         const s = hass.states[id];
         let [x, y] = p;
@@ -575,24 +638,63 @@ export class FloorPlanCard extends LitElement {
         </span>`;
       });
 
+    // Zoom: scale the stage so the room's outline fills the map, then keep it inside the plan's edges.
+    let stage = "";
+    let inv = 1;
+    if (zoom) {
+      const xs = zoom.shape.map((p) => p[0]);
+      const ys = zoom.shape.map((p) => p[1]);
+      const pad = 3 * unit;
+      const [x0, x1, y0, y1] = [Math.min(...xs) - pad, Math.max(...xs) + pad, Math.min(...ys) - pad, Math.max(...ys) + pad];
+      const k = Math.min(w / (x1 - x0), h / (y1 - y0), 3.2);
+      const clamp = (v: number) => Math.min(0, Math.max((1 - k) * 100, v));
+      const tx = clamp((0.5 - (k * (x0 + x1)) / 2 / w) * 100);
+      const ty = clamp((0.5 - (k * (y0 + y1)) / 2 / h) * 100);
+      stage = `transform: translate(${tx}%, ${ty}%) scale(${k})`;
+      inv = 1 / k;
+    }
+
+    const ctls = Object.entries(pos)
+      .filter(([id]) => zoom && !this._arrange && hass.states[id] && this._inRoom(id, zoom))
+      .map(([id, [x, y]]) => {
+        const s = hass.states[id];
+        const light = domainOf(id) === "light";
+        const on = light ? s.state === "on" : id === c.vacuum ? s.state === "cleaning" : !isOff(s);
+        const fill = light && on ? `--fill: rgb(${this._rgb(s).join(",")})` : "";
+        // Map labels are short: drop a trailing "(model)" such as "Lava Lamp (LEDVANCE Plug Z3)".
+        const name = (id === c.vacuum ? this._name(s) : this._name(s, zoom)).replace(/\s*\([^)]*\)$/, "");
+        return html`<button class="ctl ${on ? "on" : ""} ${s.state === "unavailable" ? "na" : ""}"
+          style="left:${(x / w) * 100}%;top:${(y / h) * 100}%;--inv:${inv};${fill}"
+          aria-label="${name}: ${this._state(s)}"
+          @pointerdown=${(ev: PointerEvent) => this._ctlDown(ev, id)}
+          @pointerup=${() => this._ctlUp()}
+          @pointerleave=${() => this._ctlUp()}
+          @pointercancel=${() => this._ctlUp()}
+          @click=${() => this._ctlClick(s)}
+          @contextmenu=${(ev: Event) => ev.preventDefault()}>
+          <span class="ctl-icon"><ha-state-icon .hass=${hass} .stateObj=${s}></ha-state-icon></span>
+          <span class="ctl-name">${name}</span>
+        </button>`;
+      });
+
     const names = this._arrange ? new Map(this._placeable().map((p) => [p.id, p.name])) : undefined;
     const handles = Object.entries(pos)
-      .filter(([id]) => this._arrange && hass.states[id])
+      .filter(([id]) => zoom && this._arrange && hass.states[id] && (this._inRoom(id, zoom) || id === this._selected))
       .map(([id, [x, y]]) => {
         const s = hass.states[id];
         const light = domainOf(id) === "light";
         const ring = light && s.state === "on" ? `--ring: rgb(${this._rgb(s).join(",")})` : "";
         const sel = this._selected === id;
-        const below = y / h < 0.18;
+        const below = zoom ? y - Math.min(...zoom.shape.map((p) => p[1])) < 12 * unit : y / h < 0.18;
         return html`<span class="handle ${sel ? "selected" : ""} ${this._dragging === id ? "dragging" : ""}"
-          style="left:${(x / w) * 100}%;top:${(y / h) * 100}%;${ring}"
+          style="left:${(x / w) * 100}%;top:${(y / h) * 100}%;--inv:${inv};${ring}"
           @pointerdown=${(ev: PointerEvent) => this._dragStart(ev, id)}>
           <ha-state-icon .hass=${hass} .stateObj=${s}></ha-state-icon>
           ${sel ? html`<span class="tag ${below ? "below" : ""}">${names?.get(id) ?? this._name(s)}</span>` : nothing}
         </span>`;
       });
 
-    const labels = c.rooms.map((room) => {
+    const labels = (zoom ? [] : c.rooms).map((room) => {
       const [x, y] = room.label ?? this._centroid(room.shape);
       const e = this._roomEntities(room);
       const on = e.lights.filter((s) => s.state === "on").length;
@@ -603,21 +705,18 @@ export class FloorPlanCard extends LitElement {
       </div>`;
     });
 
-    return html`<div class="map ${this._arrange ? "arranging" : ""}" style="aspect-ratio:${w} / ${h}"
+    return html`<div class="map ${this._arrange ? "arranging" : ""} ${zoom ? "zoomed" : ""}" style="aspect-ratio:${w} / ${h}"
         @pointermove=${(ev: PointerEvent) => this._dragMove(ev)}
         @pointerup=${() => this._dragEnd()}
         @pointercancel=${() => this._dragEnd()}>
-      <svg class="plan" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" @pointerdown=${(ev: PointerEvent) => this._mapDown(ev)}>
-        <defs>${defs}</defs>
-        <rect class="walls" x="0" y="0" width=${w} height=${h} rx=${unit * 1.5}></rect>
-        ${rooms}${glows}${dots}
-      </svg>
-      <div class="overlay">${labels}${icons}${handles}</div>
-      ${this._arrange
-        ? nothing
-        : html`<button class="arrange-btn" aria-label="Place devices on the map" title="Place devices on the map" @click=${() => this._enterArrange()}>
-            <ha-icon icon="mdi:cursor-move"></ha-icon>
-          </button>`}
+      <div class="stage" style=${stage}>
+        <svg class="plan" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" @pointerdown=${(ev: PointerEvent) => this._mapDown(ev)}>
+          <defs>${defs}</defs>
+          <rect class="walls" x="0" y="0" width=${w} height=${h} rx=${unit * 1.5}></rect>
+          ${rooms}${glows}${dots}
+        </svg>
+        <div class="overlay">${labels}${icons}${ctls}${handles}</div>
+      </div>
     </div>`;
   }
 
@@ -633,38 +732,30 @@ export class FloorPlanCard extends LitElement {
     </div>`;
   }
 
-  private _renderArrange() {
+  private _renderArrange(room: RoomConfig) {
     const pos = this._positions;
     const all = this._placeable();
     const sel = this._selected ? all.find((p) => p.id === this._selected) : undefined;
     const selState = sel ? this.hass!.states[sel.id] : undefined;
-    const unplaced = all.filter((p) => !pos[p.id]);
-    const byRoom = new Map<string, typeof unplaced>();
-    for (const p of unplaced) byRoom.set(p.room || "Other", [...(byRoom.get(p.room || "Other") ?? []), p]);
+    const roomName = this._roomName(room);
+    const unplaced = all.filter((p) => !pos[p.id] && (p.room === roomName || this._areaOf(p.id) === room.area));
     return html`<div class="arrange">
       ${sel && selState
         ? html`<div class="selected-row">
             <span class="sel-icon"><ha-state-icon .hass=${this.hass} .stateObj=${selState}></ha-state-icon></span>
-            <span class="sel-text"><b>${sel.name}</b>${sel.room ? html`<span>${sel.room}</span>` : nothing}</span>
+            <span class="sel-text"><b>${sel.name}</b><span>Drag it to where it really is</span></span>
             <button class="btn" @click=${() => this._remove(sel.id)}>Remove</button>
           </div>`
-        : html`<div class="hint">Drag each device to where it really is. Tap one to see its name.</div>`}
+        : html`<div class="hint">Drag each device to where it really is. Changes save as you go.</div>`}
       ${unplaced.length
-        ? html`<div class="section">Add to the map</div>
-            ${[...byRoom].map(
-              ([room, items]) => html`<div class="add-group">
-                <div class="add-room">${room}</div>
-                <div class="wrap">
-                  ${items.map(
-                    (p) => html`<button class="pill" @click=${() => this._add(p)}><ha-icon icon="mdi:plus"></ha-icon>${p.name}</button>`,
-                  )}
-                </div>
-              </div>`,
-            )}`
+        ? html`<div class="section">Not on the map yet</div>
+            <div class="wrap">
+              ${unplaced.map((p) => html`<button class="pill" @click=${() => this._add(p.id, room)}><ha-icon icon="mdi:plus"></ha-icon>${p.name}</button>`)}
+            </div>`
         : nothing}
       <div class="arrange-more">
         <button class="link" @click=${() => this._showYaml()}>Copy positions for the dashboard YAML</button>
-        ${this._saved ? html`<button class="link danger" @click=${() => this._reset()}>Reset to defaults</button>` : nothing}
+        ${this._saved ? html`<button class="link danger" @click=${() => this._reset()}>Reset all rooms to defaults</button>` : nothing}
       </div>
       ${this._yaml
         ? html`<textarea class="yaml" readonly rows="8" .value=${this._yaml} @focus=${(e: Event) => (e.target as HTMLTextAreaElement).select()}></textarea>
@@ -673,27 +764,49 @@ export class FloorPlanCard extends LitElement {
     </div>`;
   }
 
-  private _renderSheet() {
+  private _headline(room: RoomConfig): string {
     const c = this._config!;
-    const room = c.rooms.find((r) => r.area === this._room);
-    if (!room) return nothing;
+    const e = this._roomEntities(room);
+    const vac = c.vacuum ? this.hass!.states[c.vacuum] : undefined;
+    const cleaningHere = !!vac && vac.state === "cleaning" && this._vacuumRoom()?.area === room.area;
+    const lightsOn = e.lights.filter((s) => s.state === "on").length;
+    return [
+      lightsOn ? `${lightsOn} light${lightsOn > 1 ? "s" : ""} on` : "Lights off",
+      ...e.media.filter((s) => !isOff(s)).map((s) => `${this._name(s, room)} on`),
+      ...(cleaningHere ? ["Cleaning"] : []),
+    ].join(" · ");
+  }
+
+  private _renderRoomBar(room: RoomConfig) {
+    if (this._arrange) {
+      return html`<div class="room-bar">
+        <button class="btn" @click=${() => this._cancelArrange()}>Cancel</button>
+        <div class="room-title center"><h2>Edit ${this._roomName(room)}</h2></div>
+        <button class="btn primary" @click=${() => this._exitArrange()}>Done</button>
+      </div>`;
+    }
+    return html`<div class="room-bar">
+      <button class="round" aria-label="Back to the whole home" @click=${() => (this._room = undefined)}><ha-icon icon="mdi:chevron-left"></ha-icon></button>
+      <div class="room-title">
+        <h2>${this._roomName(room)}</h2>
+        <div class="headline">${this._headline(room)}</div>
+      </div>
+      <button class="btn" @click=${() => this._enterArrange()}><ha-icon icon="mdi:cursor-move"></ha-icon>Edit</button>
+    </div>`;
+  }
+
+  private _renderRoom(room: RoomConfig) {
+    const c = this._config!;
     const hass = this.hass!;
     const e = this._roomEntities(room);
     const group = room.light ? hass.states[room.light] : undefined;
     const groupPct = group ? this._pct(group) : 0;
     const vac = c.vacuum ? hass.states[c.vacuum] : undefined;
     const cleaningHere = !!vac && vac.state === "cleaning" && this._vacuumRoom()?.area === room.area;
-    const close = () => (this._room = undefined);
     const na = (s: HassEntity) => s.state === "unavailable";
     const media = e.media.filter((s) => !na(s));
     const devices = e.devices.filter((s) => !na(s));
     const offline = [...e.media, ...e.devices].filter(na);
-    const lightsOn = e.lights.filter((s) => s.state === "on").length;
-    const headline = [
-      lightsOn ? `${lightsOn} light${lightsOn > 1 ? "s" : ""} on` : "Lights off",
-      ...media.filter((s) => !isOff(s)).map((s) => `${this._name(s, room)} on`),
-      ...(cleaningHere ? ["Cleaning"] : []),
-    ].join(" · ");
     const tileRef = (entity: string, name: string) =>
       ref((el?: Element) => {
         const t = el as (HTMLElement & { setConfig(c: unknown): void; _dgKey?: string }) | undefined;
@@ -703,16 +816,7 @@ export class FloorPlanCard extends LitElement {
         }
       });
 
-    return html`<div class="scrim" @click=${close}></div>
-      <div class="sheet" role="dialog" aria-label=${this._roomName(room)} @keydown=${(ev: KeyboardEvent) => ev.key === "Escape" && close()}>
-        <div class="grabber"></div>
-        <div class="sheet-head">
-          <div>
-            <h2>${this._roomName(room)}</h2>
-            <div class="headline">${headline}</div>
-          </div>
-          <button class="round" aria-label="Close" @click=${close}><ha-icon icon="mdi:close"></ha-icon></button>
-        </div>
+    return html`<div class="room-panel" @keydown=${(ev: KeyboardEvent) => ev.key === "Escape" && (this._room = undefined)}>
         ${e.chips.length
           ? html`<div class="chips">
               ${e.chips.map(
@@ -898,8 +1002,116 @@ export class FloorPlanCard extends LitElement {
     .map {
       position: relative;
       width: 100%;
+      overflow: hidden;
+      border-radius: calc(var(--ha-card-border-radius, 12px) - 6px);
       user-select: none;
       -webkit-user-select: none;
+    }
+    .stage {
+      position: absolute;
+      inset: 0;
+      transform-origin: 0 0;
+      transition: transform 450ms cubic-bezier(0.2, 0.8, 0.2, 1);
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .stage {
+        transition: none;
+      }
+    }
+    .room.dim {
+      opacity: 0.4;
+    }
+    .map.zoomed .walls {
+      opacity: 0.25;
+    }
+    /* Controls in a zoomed room: counter-scaled so they keep their size, shown once the zoom lands. */
+    .ctl {
+      position: absolute;
+      transform: translate(-50%, -21px) scale(var(--inv, 1));
+      transform-origin: 50% 21px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 3px;
+      pointer-events: all;
+      -webkit-tap-highlight-color: transparent;
+      animation: ctl-in 220ms ease 300ms both;
+    }
+    @keyframes ctl-in {
+      from {
+        opacity: 0;
+      }
+    }
+    .ctl-icon {
+      width: 42px;
+      height: 42px;
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      background: var(--fp-bg);
+      color: var(--secondary-text-color);
+      box-shadow: 0 0 0 1px var(--divider-color, rgba(0, 0, 0, 0.12)), 0 2px 8px rgba(0, 0, 0, 0.25);
+      --mdc-icon-size: 22px;
+      transition: background 150ms ease, color 150ms ease;
+    }
+    .ctl.on .ctl-icon {
+      background: var(--fill, var(--fp-accent));
+      color: #1c1c1e;
+    }
+    .ctl.na .ctl-icon {
+      opacity: 0.45;
+      box-shadow: 0 0 0 1px var(--divider-color, rgba(0, 0, 0, 0.12));
+    }
+    .ctl:active .ctl-icon {
+      transform: scale(0.92);
+    }
+    .ctl-name {
+      max-width: 96px;
+      padding: 1px 6px;
+      border-radius: 6px;
+      background: color-mix(in srgb, var(--fp-bg) 80%, transparent);
+      font-size: 11px;
+      font-weight: 600;
+      line-height: 1.3;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .room-bar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-height: 44px;
+    }
+    .room-title {
+      flex: 1;
+      min-width: 0;
+    }
+    .room-title.center {
+      text-align: center;
+    }
+    .room-title h2 {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .btn ha-icon {
+      --mdc-icon-size: 16px;
+      margin-right: 4px;
+      vertical-align: -3px;
+    }
+    /* The room's controls sit on the card itself, so their surfaces get a tint instead of the card colour. */
+    .room-panel {
+      --ha-card-background: color-mix(in srgb, var(--primary-text-color, #1c1c1e) 8%, var(--card-background-color, #fff));
+    }
+    .room-panel .chip,
+    .room-panel .card,
+    .room-panel .tile {
+      background: var(--fp-surface);
+    }
+    .room-panel > h3:first-child,
+    .room-panel > .chips:first-child {
+      margin-top: 0;
     }
     .map.arranging {
       touch-action: none;
@@ -993,7 +1205,7 @@ export class FloorPlanCard extends LitElement {
     }
     .handle {
       position: absolute;
-      transform: translate(-50%, -50%);
+      transform: translate(-50%, -50%) scale(var(--inv, 1));
       width: 30px;
       height: 30px;
       border-radius: 50%;
@@ -1021,7 +1233,7 @@ export class FloorPlanCard extends LitElement {
     }
     .handle.dragging {
       cursor: grabbing;
-      transform: translate(-50%, -50%) scale(1.2);
+      transform: translate(-50%, -50%) scale(calc(var(--inv, 1) * 1.2));
     }
     .tag {
       position: absolute;
@@ -1044,16 +1256,6 @@ export class FloorPlanCard extends LitElement {
     /* While dragging, lift the name clear of the finger. */
     .handle.dragging .tag:not(.below) {
       bottom: calc(100% + 30px);
-    }
-    .arrange-bar {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
-    }
-    .arrange-title {
-      font-size: 16px;
-      font-weight: 600;
     }
     .selected-row {
       display: flex;
@@ -1206,57 +1408,6 @@ export class FloorPlanCard extends LitElement {
       background: var(--fp-surface);
       color: var(--primary-text-color);
       padding: 8px;
-    }
-    .scrim {
-      position: fixed;
-      inset: 0;
-      z-index: 100;
-      background: rgba(0, 0, 0, 0.35);
-    }
-    .sheet {
-      position: fixed;
-      z-index: 101;
-      left: 0;
-      right: 0;
-      bottom: 0;
-      max-height: 88vh;
-      overflow-y: auto;
-      overscroll-behavior: contain;
-      box-sizing: border-box;
-      padding: 8px 16px calc(24px + env(safe-area-inset-bottom));
-      border-radius: 28px 28px 0 0;
-      background: var(--primary-background-color, #f2f2f7);
-      color: var(--primary-text-color);
-      animation: up 220ms ease;
-    }
-    @media (min-width: 700px) {
-      .sheet {
-        left: 50%;
-        right: auto;
-        width: 520px;
-        transform: translateX(-50%);
-        bottom: 24px;
-        border-radius: 28px;
-        animation: none;
-      }
-    }
-    @keyframes up {
-      from {
-        transform: translateY(40%);
-        opacity: 0;
-      }
-    }
-    .grabber {
-      width: 36px;
-      height: 5px;
-      border-radius: 3px;
-      background: var(--divider-color, rgba(0, 0, 0, 0.2));
-      margin: 0 auto 12px;
-    }
-    .sheet-head {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
     }
     h2 {
       margin: 0;
