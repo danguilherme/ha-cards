@@ -52,6 +52,7 @@ export interface FloorPlanConfig {
 
 const TAG = "dg-floor-plan";
 const HOLD_MS = 500;
+const HISTORY_KEY = "dgFloorPlanSheet";
 const FALLBACK_RGB: [number, number, number] = [255, 179, 64];
 const CHIP_SENSORS: Record<string, string[]> = {
   sensor: ["temperature", "humidity", "illuminance", "co2", "pm25"],
@@ -131,7 +132,44 @@ export class FloorPlanCard extends LitElement {
     return { columns: 12, min_columns: 6, rows: "auto" };
   }
 
-  protected updated(): void {
+  // --- Back closes the sheet ---------------------------------------------------------------------
+  // Opening the sheet pushes a history entry (same URL), so the phone's Back / browser back pops it and
+  // closes the sheet instead of leaving the view. Closing it any other way pops that entry again. HA's
+  // more-info dialogs stack their own entries on top, so Back closes those first, then the sheet.
+
+  private _historyPushed = false;
+
+  private _onPopState = (): void => {
+    if (!this._historyPushed || (history.state as Record<string, unknown> | null)?.[HISTORY_KEY]) return;
+    this._historyPushed = false;
+    this._room = undefined;
+  };
+
+  connectedCallback(): void {
+    super.connectedCallback();
+    window.addEventListener("popstate", this._onPopState);
+  }
+
+  disconnectedCallback(): void {
+    super.disconnectedCallback();
+    window.removeEventListener("popstate", this._onPopState);
+    this._historyPushed = false;
+    this._room = undefined;
+  }
+
+  private _syncHistory(wasOpen: boolean): void {
+    const open = !!this._room;
+    if (open && !wasOpen && !this._historyPushed) {
+      history.pushState({ [HISTORY_KEY]: true }, "");
+      this._historyPushed = true;
+    } else if (!open && wasOpen && this._historyPushed) {
+      this._historyPushed = false;
+      history.back();
+    }
+  }
+
+  protected updated(changed: Map<PropertyKey, unknown>): void {
+    if (changed.has("_room")) this._syncHistory(!!changed.get("_room"));
     if (!this._loadedLayout && this.hass?.callWS) {
       this._loadedLayout = true;
       this.hass
