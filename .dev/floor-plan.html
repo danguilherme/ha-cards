@@ -1,0 +1,132 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>dg-floor-plan preview</title>
+    <style>
+      body {
+        --card-background-color: #fff; --ha-card-background: #fff; --ha-card-border-radius: 22px;
+        --primary-background-color: #f2f2f7; --secondary-background-color: #e5e5ea;
+        --primary-text-color: #1c1c1e; --secondary-text-color: #6e6e73; --divider-color: rgba(60,60,67,.12);
+        --primary-color: #ff9f0a; --state-inactive-color: #aeaeb2;
+        margin: 0; padding: 12px; background: var(--primary-background-color); color: var(--primary-text-color);
+        font-family: -apple-system, Inter, system-ui, sans-serif;
+      }
+      body.dark {
+        --card-background-color: #1c1c1e; --ha-card-background: #1c1c1e; --primary-background-color: #000;
+        --secondary-background-color: #2c2c2e; --primary-text-color: #f2f2f7; --secondary-text-color: #8e8e93;
+        --divider-color: rgba(84,84,88,.48);
+      }
+      .bar { display: flex; gap: 8px; margin-bottom: 10px; font-size: 13px; }
+      #log { margin-top: 12px; font: 12px ui-monospace, monospace; white-space: pre-wrap; color: var(--secondary-text-color); }
+    </style>
+  </head>
+  <body>
+    <div class="bar"><button id="dark">Toggle dark</button><button id="clean">Toggle Monica cleaning</button></div>
+    <div id="mount" style="max-width: 560px"></div>
+    <div id="log"></div>
+    <script type="module">
+      // Mocked hass shaped like the real house. `yarn dev`, then open http://localhost:5173/preview/floor-plan.html
+      customElements.define("ha-card", class extends HTMLElement {
+        connectedCallback() { this.style.cssText += ";display:block;border-radius:22px;background:var(--ha-card-background)"; }
+      });
+      const glyph = (id) => ({ light: "💡", media_player: "📺", vacuum: "🤖", switch: "⏻", binary_sensor: "◉", sensor: "◌" })[id.split(".")[0]] ?? "•";
+      customElements.define("ha-state-icon", class extends HTMLElement {
+        set stateObj(s) { this.textContent = glyph(s.entity_id); this.style.fontSize = "14px"; }
+      });
+      customElements.define("ha-icon", class extends HTMLElement {
+        set icon(v) { this.textContent = v.replace("mdi:", "").slice(0, 2); this.style.fontSize = "11px"; }
+        static get observedAttributes() { return ["icon"]; }
+        attributeChangedCallback(_, __, v) { this.icon = v; }
+      });
+
+      const log = (m) => (document.getElementById("log").textContent = m + "\n" + document.getElementById("log").textContent);
+      const L = (id, name, area, on, bri, rgb, extra = {}) => [id, { name, area, state: on, attributes: { friendly_name: name, brightness: bri, rgb_color: rgb, supported_color_modes: ["hs"], ...extra } }];
+      const E = (id, name, area, state, attributes = {}, reg = {}) => [id, { name, area, state, attributes: { friendly_name: name, ...attributes }, reg }];
+      const defs = Object.fromEntries([
+        L("light.living_room_ceiling_c1600", "Living Room ceiling C1600", "living_room", "on", 190, [255, 190, 120]),
+        L("light.lamp_2", "Lamp", "living_room", "on", 150, [141, 41, 255]),
+        L("light.hue_filament_bulb_1", "Hue filament", "living_room", "off"),
+        L("light.all_living_room_lights", "All living room lights", "living_room", "on", 170, [255, 190, 120], { entity_id: ["light.lamp_2"] }),
+        L("light.kitchen_ceiling_wa1600", "Kitchen ceiling WA1600", "kitchen", "off"),
+        L("light.christmas_lights", "Christmas lights", "kitchen", "on", 128, [52, 199, 89]),
+        L("light.kitchen", "Kitchen", "kitchen", "on", 128, [52, 199, 89], { is_hue_group: true }),
+        L("light.all_kitchen_lights", "All kitchen lights", "kitchen", "on", 128, [52, 199, 89], { entity_id: [] }),
+        L("light.bedside_lamp", "Bedside Lamp", "bedroom", "unavailable"),
+        L("light.red_light_ledvance_plug_z3", "Red Light (LEDVANCE Plug Z3)", "bedroom", "on", 255, [255, 59, 48]),
+        L("light.all_bedroom_lights", "All bedroom lights", "bedroom", "on", 255, [255, 59, 48], { entity_id: [] }),
+        L("light.bathroom_cieling_c806", "Bathroom cieling C806", "bathroom", "on", 230, [90, 140, 255]),
+        L("light.all_bathroom_lights", "All bathroom lights", "bathroom", "on", 230, [90, 140, 255], { entity_id: [] }),
+        L("light.lava_lamp_ledvance_plug_z3", "Lava Lamp (LEDVANCE Plug Z3)", "hall", "on", 255, [255, 120, 40]),
+        E("scene.living_room_entspannen", "Living Room Entspannen", "living_room", "2026-01-01"),
+        E("scene.living_room_lesen", "Living Room Lesen", "living_room", "2026-01-01"),
+        E("scene.ha_movie_time", "HA Movie Time", "living_room", "2026-01-01"),
+        E("scene.kitchen_chill", "Kitchen Chill", "kitchen", "unknown"),
+        E("scene.bathroom_day", "Bathroom: Day (bright white)", "bathroom", "2026-01-01"),
+        E("scene.bathroom_night", "Bathroom: Night (light yellow)", "bathroom", "2026-01-01"),
+        E("media_player.tv", "TV", "living_room", "on", { app_name: "Netflix" }),
+        E("media_player.samsung_soundbar_q990c", "Samsung Soundbar Q990C", "living_room", "unavailable"),
+        E("media_player.playstation_5", "PlayStation 5", "living_room", "unavailable"),
+        E("media_player.kitchen_echo_show", "Echo Show", "kitchen", "unavailable"),
+        E("sensor.echo_living_room_temperature", "Echo Living Room Temperature", "living_room", "21.5", { device_class: "temperature", unit_of_measurement: "°C" }),
+        E("sensor.bathroom_sensor_temperature", "Motion sensor Temperature", "bathroom", "20.1", { device_class: "temperature", unit_of_measurement: "°C" }),
+        E("binary_sensor.bathroom_sensor_motion", "Motion sensor Motion", "bathroom", "off", { device_class: "motion" }),
+        E("sensor.bathroom_sensor_battery", "Motion sensor Battery", "bathroom", "100", { device_class: "battery", unit_of_measurement: "%" }, { entity_category: "diagnostic" }),
+        E("switch.echo_show_do_not_disturb", "Echo Show Do not disturb", "kitchen", "unavailable"),
+        E("switch.bathroom_sensor_motion_sensor_enabled", "Motion sensor enabled", "bathroom", "on", {}, { entity_category: "config" }),
+        E("switch.red_light_ledvance_plug_z3", "Red Light (LEDVANCE Plug Z3)", "bedroom", "on", {}, { hidden: true }),
+        E("vacuum.monica", "Monica", "living_room", "docked", {}, { device_id: "dev_monica" }),
+        E("sensor.monica_battery", "Monica Battery", "living_room", "100", { device_class: "battery" }, { device_id: "dev_monica" }),
+        E("sensor.monica_current_room", "Monica Current room", "living_room", "Living room", {}, { device_id: "dev_monica" }),
+        E("binary_sensor.door_detector_door", "Door Detector Door", null, "off", { device_class: "door" }),
+        E("scene.ha_all_lights_off", "HA All lights off", "whole_apartment", "x"),
+        E("scene.ha_bedtime", "HA Bedtime", "whole_apartment", "x"),
+      ]);
+      const states = {};
+      const entities = {};
+      for (const [id, d] of Object.entries(defs)) {
+        states[id] = { entity_id: id, state: d.state, attributes: d.attributes };
+        entities[id] = { entity_id: id, area_id: d.area, device_id: null, hidden: false, entity_category: null, ...d.reg };
+      }
+      const areas = Object.fromEntries(["living_room:Living Room", "kitchen:Kitchen", "bedroom:Bedroom", "bathroom:Bathroom", "hall:Hall"].map((s) => s.split(":")).map(([a, n]) => [a, { area_id: a, name: n }]));
+      let userData = {};
+      let dark = false;
+      let card;
+      const push = () => (card.hass = makeHass());
+      const set = (id, patch) => { states[id] = { ...states[id], ...patch, attributes: { ...states[id].attributes, ...(patch.attributes ?? {}) } }; push(); };
+      const makeHass = () => ({
+        states: { ...states }, entities, devices: { dev_monica: { id: "dev_monica", area_id: "living_room" } }, areas,
+        themes: { darkMode: dark },
+        formatEntityState: (s) => s.state === "unavailable" ? "Unavailable" : s.attributes.unit_of_measurement ? `${s.state} ${s.attributes.unit_of_measurement}` : s.state.charAt(0).toUpperCase() + s.state.slice(1),
+        async callWS(msg) {
+          log(`ws ${JSON.stringify(msg)}`);
+          if (msg.type === "frontend/get_user_data") return { value: userData[msg.key] ?? null };
+          if (msg.type === "frontend/set_user_data") userData[msg.key] = msg.value;
+          return null;
+        },
+        async callService(domain, service, data) {
+          log(`${domain}.${service} ${JSON.stringify(data)}`);
+          const id = data.entity_id;
+          if (domain === "light" || (domain === "homeassistant" && id?.startsWith("light."))) {
+            const on = service === "turn_on" || (service === "toggle" && states[id].state !== "on");
+            set(id, { state: on ? "on" : "off", attributes: data.brightness_pct ? { brightness: Math.round(data.brightness_pct * 2.55) } : {} });
+          } else if (domain === "vacuum") {
+            set(id, { state: service === "return_to_base" ? "docked" : "cleaning" });
+            if (data.cleaning_area_id) set("sensor.monica_current_room", { state: areas[data.cleaning_area_id[0]].name === "Hall" ? "Hallway" : areas[data.cleaning_area_id[0]].name.replace("Living Room", "Living room") });
+          } else if (domain === "media_player" && service === "toggle") set(id, { state: states[id].state === "off" ? "on" : "off" });
+        },
+      });
+      window.addEventListener("hass-more-info", (e) => log(`more-info ${e.detail.entityId}`));
+      document.getElementById("dark").onclick = () => { dark = !dark; document.body.classList.toggle("dark", dark); push(); };
+      document.getElementById("clean").onclick = () => set("vacuum.monica", { state: states["vacuum.monica"].state === "cleaning" ? "docked" : "cleaning" });
+
+      await import("/ha-cards.js");
+      card = document.createElement("dg-floor-plan");
+      const res = await fetch("/preview/floor-plan.json");
+      card.setConfig(await res.json());
+      push();
+      document.getElementById("mount").appendChild(card);
+    </script>
+  </body>
+</html>

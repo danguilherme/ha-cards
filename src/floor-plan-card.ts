@@ -1,0 +1,1180 @@
+import { LitElement, css, html, nothing, svg, type TemplateResult } from "lit";
+import { ref } from "lit/directives/ref.js";
+import "./light-tile-card";
+import { fireMoreInfo, registerCard, type HassEntity, type HomeAssistant } from "./types";
+
+type Point = [number, number];
+
+export interface QuickAction {
+  name: string;
+  icon?: string;
+  /** Tap: scene/script → turn_on, vacuum → start / return to base, anything else → toggle. */
+  entity?: string;
+  /** Overrides the entity behaviour: "domain.service", called with `data` (+ entity_id when `entity` is set). */
+  action?: string;
+  data?: Record<string, unknown>;
+}
+
+export interface RoomConfig {
+  /** HA area id. The sheet lists everything assigned to it (directly or through its device). */
+  area: string;
+  name?: string;
+  /** Polygon in plan units, e.g. [[37, 37], [485, 37], [485, 435], [37, 435]]. */
+  shape: Point[];
+  /** Where the room name goes. Defaults to the polygon's centroid. */
+  label?: Point;
+  /** Light group for the whole room: hold the room to toggle it, room slider in the sheet. */
+  light?: string;
+  /** The vacuum can clean this area (vacuum.clean_area). Needs the area ↔ map-segment mapping in HA. */
+  clean?: boolean;
+  /** Name of this room in the vacuum's current-room sensor, if it differs from `name`. */
+  vacuum_room?: string;
+  /** Entities to leave out of this room's sheet and map. */
+  exclude?: string[];
+}
+
+export interface FloorPlanConfig {
+  type: string;
+  /** Plan size in plan units (any unit, e.g. centimetres): [width, height]. */
+  size: Point;
+  rooms: RoomConfig[];
+  quick_actions?: QuickAction[];
+  vacuum?: string;
+  /** Sensor holding the vacuum's current room name (moves its icon on the map while cleaning). */
+  vacuum_room_sensor?: string;
+  /** Default positions, plan units. Positions saved from the card's arrange mode take precedence. */
+  positions?: Record<string, Point>;
+  /** Key for positions saved per HA user (frontend user data). */
+  layout_key?: string;
+  /** Hide the "n lights on · …" line. */
+  hide_summary?: boolean;
+}
+
+const TAG = "dg-floor-plan";
+const HOLD_MS = 500;
+const FALLBACK_RGB: [number, number, number] = [255, 179, 64];
+const CHIP_SENSORS: Record<string, string[]> = {
+  sensor: ["temperature", "humidity", "illuminance", "co2", "pm25"],
+  binary_sensor: ["motion", "occupancy", "presence", "door", "window", "opening", "moisture", "smoke"],
+};
+const DEVICE_DOMAINS = ["switch", "input_boolean", "fan", "cover", "climate", "lock", "humidifier", "valve", "siren", "water_heater"];
+const TOGGLE_DOMAINS = ["switch", "input_boolean", "fan", "cover", "lock", "humidifier", "valve", "siren", "light"];
+const PLACEABLE_DOMAINS = ["light", "media_player", "vacuum", "binary_sensor", ...DEVICE_DOMAINS];
+
+interface RoomEntities {
+  lights: HassEntity[];
+  scenes: HassEntity[];
+  media: HassEntity[];
+  devices: HassEntity[];
+  chips: HassEntity[];
+}
+
+const domainOf = (id: string) => id.slice(0, id.indexOf("."));
+const isOff = (s?: HassEntity) => !s || ["off", "unavailable", "unknown", "idle", "standby", "docked"].includes(s.state);
+
+/**
+ * Floor plan of the home: quick actions on top, rooms tinted by their lights (each bulb glows in its own
+ * colour at its position), tap a room for a sheet with everything in that area, hold a room to toggle its
+ * light group. An arrange mode lets you drag lights and devices to where they really are.
+ */
+export class FloorPlanCard extends LitElement {
+  static properties = {
+    hass: { attribute: false },
+    _config: { state: true },
+    _room: { state: true },
+    _arrange: { state: true },
+    _saved: { state: true },
+    _draft: { state: true },
+    _placing: { state: true },
+    _yaml: { state: true },
+    _dragging: { state: true },
+  };
+
+  declare hass?: HomeAssistant;
+  private declare _config?: FloorPlanConfig;
+  private declare _room?: string;
+  private declare _arrange: boolean;
+  private declare _saved?: Record<string, Point>;
+  private declare _draft?: Record<string, Point>;
+  private declare _placing?: string;
+  private declare _yaml?: string;
+  private declare _dragging?: string;
+
+  private _loadedLayout = false;
+  private _hold?: { timer: number; fired: boolean };
+
+  constructor() {
+    super();
+    this._arrange = false;
+  }
+
+  static getStubConfig(): Partial<FloorPlanConfig> {
+    return { size: [1000, 600], rooms: [{ area: "living_room", shape: [[0, 0], [600, 0], [600, 600], [0, 600]] }] };
+  }
+
+  setConfig(config: FloorPlanConfig): void {
+    if (!Array.isArray(config?.size) || config.size.length !== 2) throw new Error(`${TAG}: 'size' must be [width, height]`);
+    if (!Array.isArray(config.rooms) || !config.rooms.length) throw new Error(`${TAG}: 'rooms' is required`);
+    for (const r of config.rooms) {
+      if (!r.area || !Array.isArray(r.shape) || r.shape.length < 3) throw new Error(`${TAG}: each room needs 'area' and a 'shape' with 3+ points`);
+    }
+    this._config = config;
+  }
+
+  getCardSize(): number {
+    return 8;
+  }
+
+  getGridOptions() {
+    return { columns: 12, min_columns: 6, rows: "auto" };
+  }
+
+  protected updated(): void {
+    if (!this._loadedLayout && this.hass?.callWS) {
+      this._loadedLayout = true;
+      this.hass
+        .callWS<{ value: Record<string, Point> | null }>({ type: "frontend/get_user_data", key: this._layoutKey })
+        .then((r) => (this._saved = r?.value ?? undefined))
+        .catch(() => undefined);
+    }
+  }
+
+  private get _layoutKey(): string {
+    return this._config?.layout_key ?? TAG;
+  }
+
+  private get _positions(): Record<string, Point> {
+    return { ...(this._config?.positions ?? {}), ...(this._saved ?? {}), ...(this._draft ?? {}) };
+  }
+
+  // --- registry helpers ---------------------------------------------------------------------------
+
+  private _areaOf(entityId: string): string | undefined {
+    const e = this.hass?.entities?.[entityId];
+    if (!e) return undefined;
+    return e.area_id ?? (e.device_id ? this.hass?.devices?.[e.device_id]?.area_id ?? undefined : undefined);
+  }
+
+  private _isGroup(s: HassEntity): boolean {
+    return Array.isArray(s.attributes.entity_id) || s.attributes.is_hue_group === true;
+  }
+
+  private _roomEntities(room: RoomConfig): RoomEntities {
+    const hass = this.hass!;
+    const vacuumDevice = this._config?.vacuum ? hass.entities?.[this._config.vacuum]?.device_id : undefined;
+    const exclude = new Set([...(room.exclude ?? []), ...(room.light ? [room.light] : [])]);
+    const out: RoomEntities = { lights: [], scenes: [], media: [], devices: [], chips: [] };
+    for (const [id, reg] of Object.entries(hass.entities ?? {})) {
+      if (reg.hidden || reg.entity_category || exclude.has(id)) continue;
+      if (vacuumDevice && reg.device_id === vacuumDevice) continue;
+      if (this._areaOf(id) !== room.area) continue;
+      const s = hass.states[id];
+      if (!s) continue;
+      const d = domainOf(id);
+      if (d === "light") {
+        if (!this._isGroup(s)) out.lights.push(s);
+      } else if (d === "scene") out.scenes.push(s);
+      else if (d === "media_player") out.media.push(s);
+      else if (DEVICE_DOMAINS.includes(d)) out.devices.push(s);
+      else if (CHIP_SENSORS[d]?.includes(s.attributes.device_class) && s.state !== "unavailable" && s.state !== "unknown") out.chips.push(s);
+    }
+    const byName = (a: HassEntity, b: HassEntity) => this._name(a, room).localeCompare(this._name(b, room));
+    out.lights.sort(byName);
+    out.scenes.sort(byName);
+    out.media.sort((a, b) => Number(a.state === "unavailable") - Number(b.state === "unavailable") || byName(a, b));
+    out.devices.sort((a, b) => Number(a.state === "unavailable") - Number(b.state === "unavailable") || byName(a, b));
+    return out;
+  }
+
+  /** Friendly name without the room prefix ("Living Room Entspannen" → "Entspannen"). */
+  private _name(s: HassEntity, room?: RoomConfig): string {
+    let n = String(this.hass?.entities?.[s.entity_id]?.name ?? s.attributes.friendly_name ?? s.entity_id);
+    n = n.replace(/^HA\s+/, "");
+    const prefixes = [room?.name, room && this.hass?.areas?.[room.area]?.name].filter(Boolean) as string[];
+    for (const p of prefixes) {
+      if (n.toLowerCase().startsWith(p.toLowerCase()) && n.length > p.length) {
+        n = n.slice(p.length).replace(/^[\s:–-]+/, "");
+        break;
+      }
+    }
+    return n.charAt(0).toUpperCase() + n.slice(1);
+  }
+
+  private _roomName(room: RoomConfig): string {
+    return room.name ?? this.hass?.areas?.[room.area]?.name ?? room.area;
+  }
+
+  private _state(s: HassEntity): string {
+    return this.hass?.formatEntityState?.(s) ?? `${s.state}${s.attributes.unit_of_measurement ? ` ${s.attributes.unit_of_measurement}` : ""}`;
+  }
+
+  private _rgb(s: HassEntity): [number, number, number] {
+    return (s.attributes.rgb_color as [number, number, number] | undefined) ?? FALLBACK_RGB;
+  }
+
+  private _pct(s: HassEntity): number {
+    return s.state === "on" ? Math.max(1, Math.round(((s.attributes.brightness ?? 255) / 255) * 100)) : 0;
+  }
+
+  private _centroid(shape: Point[]): Point {
+    const xs = shape.map((p) => p[0]);
+    const ys = shape.map((p) => p[1]);
+    return [(Math.min(...xs) + Math.max(...xs)) / 2, (Math.min(...ys) + Math.max(...ys)) / 2];
+  }
+
+  private _vacuumRoom(): RoomConfig | undefined {
+    const c = this._config!;
+    const v = c.vacuum ? this.hass?.states[c.vacuum] : undefined;
+    if (!v || v.state !== "cleaning" || !c.vacuum_room_sensor) return undefined;
+    const current = this.hass?.states[c.vacuum_room_sensor]?.state?.toLowerCase();
+    return c.rooms.find((r) => (r.vacuum_room ?? this._roomName(r)).toLowerCase() === current);
+  }
+
+  // --- actions ------------------------------------------------------------------------------------
+
+  private _call(domain: string, service: string, data: Record<string, unknown>): void {
+    this.hass?.callService(domain, service, data);
+  }
+
+  private _runQuick(a: QuickAction): void {
+    if (a.action) {
+      const [domain, service] = a.action.split(".");
+      this._call(domain, service, { ...(a.entity ? { entity_id: a.entity } : {}), ...(a.data ?? {}) });
+      return;
+    }
+    if (!a.entity) return;
+    const d = domainOf(a.entity);
+    if (d === "scene" || d === "script") this._call(d, "turn_on", { entity_id: a.entity });
+    else if (d === "vacuum") {
+      const s = this.hass?.states[a.entity]?.state;
+      this._call("vacuum", s === "cleaning" ? "return_to_base" : "start", { entity_id: a.entity });
+    } else this._call("homeassistant", "toggle", { entity_id: a.entity });
+  }
+
+  private _toggleEntity(s: HassEntity): void {
+    if (s.state === "unavailable") return;
+    const d = domainOf(s.entity_id);
+    if (TOGGLE_DOMAINS.includes(d)) this._call(d === "cover" || d === "lock" || d === "valve" ? "homeassistant" : d, "toggle", { entity_id: s.entity_id });
+    else fireMoreInfo(this, s.entity_id);
+  }
+
+  private _roomDown(ev: PointerEvent, room: RoomConfig): void {
+    if (this._arrange) {
+      this._mapDown(ev);
+      return;
+    }
+    if (ev.button !== 0) return;
+    const timer = window.setTimeout(() => {
+      if (!this._hold) return;
+      this._hold.fired = true;
+      if (room.light) this._call("light", "toggle", { entity_id: room.light });
+    }, HOLD_MS);
+    this._hold = { timer, fired: false };
+  }
+
+  private _roomUp(room: RoomConfig): void {
+    if (this._arrange || !this._hold) return;
+    clearTimeout(this._hold.timer);
+    const fired = this._hold.fired;
+    this._hold = undefined;
+    if (!fired) this._room = room.area;
+  }
+
+  private _roomCancel(): void {
+    if (this._hold) clearTimeout(this._hold.timer);
+    this._hold = undefined;
+  }
+
+  // --- arrange mode -------------------------------------------------------------------------------
+
+  private _toPlan(ev: PointerEvent): Point | undefined {
+    const svgEl = this.renderRoot.querySelector("svg.plan");
+    if (!svgEl || !this._config) return undefined;
+    const b = svgEl.getBoundingClientRect();
+    const [w, h] = this._config.size;
+    const x = Math.round(((ev.clientX - b.left) / b.width) * w);
+    const y = Math.round(((ev.clientY - b.top) / b.height) * h);
+    return [Math.min(w, Math.max(0, x)), Math.min(h, Math.max(0, y))];
+  }
+
+  private _mapDown(ev: PointerEvent): void {
+    if (!this._arrange || !this._placing) return;
+    const p = this._toPlan(ev);
+    if (!p) return;
+    this._draft = { ...(this._draft ?? {}), [this._placing]: p };
+    this._placing = undefined;
+  }
+
+  private _dragStart(ev: PointerEvent, id: string): void {
+    if (!this._arrange) return;
+    ev.stopPropagation();
+    (ev.currentTarget as Element).setPointerCapture?.(ev.pointerId);
+    this._dragging = id;
+    this._placing = undefined;
+  }
+
+  private _dragMove(ev: PointerEvent): void {
+    if (!this._dragging) return;
+    const p = this._toPlan(ev);
+    if (p) this._draft = { ...(this._draft ?? {}), [this._dragging]: p };
+  }
+
+  private _dragEnd(): void {
+    this._dragging = undefined;
+  }
+
+  private _placeable(): { id: string; name: string; room: string }[] {
+    const out: { id: string; name: string; room: string }[] = [];
+    for (const room of this._config!.rooms) {
+      const e = this._roomEntities(room);
+      for (const s of [...e.lights, ...e.media, ...e.devices, ...e.chips]) {
+        if (PLACEABLE_DOMAINS.includes(domainOf(s.entity_id))) out.push({ id: s.entity_id, name: this._name(s, room), room: this._roomName(room) });
+      }
+    }
+    const v = this._config!.vacuum;
+    if (v && this.hass?.states[v]) out.push({ id: v, name: `${this._name(this.hass.states[v])} dock`, room: "" });
+    // Positioned entities outside the rooms' areas (e.g. a door sensor with no area) can still be moved.
+    for (const id of Object.keys(this._positions)) {
+      const s = this.hass?.states[id];
+      if (s && !out.some((p) => p.id === id)) out.push({ id, name: this._name(s), room: "" });
+    }
+    return out;
+  }
+
+  private async _save(): Promise<void> {
+    const value = { ...(this._saved ?? {}), ...(this._draft ?? {}) };
+    await this.hass?.callWS?.({ type: "frontend/set_user_data", key: this._layoutKey, value });
+    this._saved = value;
+    this._draft = undefined;
+  }
+
+  private async _reset(): Promise<void> {
+    await this.hass?.callWS?.({ type: "frontend/set_user_data", key: this._layoutKey, value: null });
+    this._saved = undefined;
+    this._draft = undefined;
+  }
+
+  private _showYaml(): void {
+    const pos = this._positions;
+    const lines = Object.keys(pos)
+      .sort()
+      .map((id) => `  ${id}: [${pos[id][0]}, ${pos[id][1]}]`);
+    this._yaml = `positions:\n${lines.join("\n")}\n`;
+    navigator.clipboard?.writeText(this._yaml).catch(() => undefined);
+  }
+
+  // --- render -------------------------------------------------------------------------------------
+
+  protected render() {
+    if (!this._config || !this.hass) return nothing;
+    const c = this._config;
+    const lightsOn = Object.values(this.hass.states).filter(
+      (s) => domainOf(s.entity_id) === "light" && s.state === "on" && !this._isGroup(s) && c.rooms.some((r) => r.area === this._areaOf(s.entity_id)),
+    ).length;
+    const media = c.rooms.flatMap((r) => this._roomEntities(r).media).filter((s) => !isOff(s));
+    const vac = c.vacuum ? this.hass.states[c.vacuum] : undefined;
+    const summary = [
+      lightsOn ? `${lightsOn} light${lightsOn > 1 ? "s" : ""} on` : "All lights off",
+      ...media.map((s) => `${this._name(s)} on`),
+      ...(vac ? [`${this._name(vac)} ${this._state(vac).toLowerCase()}`] : []),
+    ].join(" · ");
+
+    return html`
+      <ha-card>
+        ${c.hide_summary ? nothing : html`<div class="summary">${summary}</div>`}
+        ${c.quick_actions?.length ? this._renderQuick(c.quick_actions) : nothing}
+        ${this._renderMap()}
+        ${this._arrange ? this._renderArrange() : this._renderPills()}
+      </ha-card>
+      ${this._room && !this._arrange ? this._renderSheet() : nothing}
+    `;
+  }
+
+  private _renderQuick(actions: QuickAction[]) {
+    return html`<div class="quick" style="grid-template-columns:repeat(${Math.min(actions.length, 4)}, minmax(0, 1fr))">
+      ${actions.map((a) => {
+        const s = a.entity ? this.hass!.states[a.entity] : undefined;
+        const d = a.entity ? domainOf(a.entity) : "";
+        const active = !!s && (d === "vacuum" ? s.state === "cleaning" : !["scene", "script"].includes(d) && !isOff(s));
+        const sub = s && !["scene", "script"].includes(d) ? this._state(s) : "";
+        return html`<button class="qa ${active ? "active" : ""}" @click=${() => this._runQuick(a)}>
+          <span class="qa-icon">${a.icon ? html`<ha-icon .icon=${a.icon}></ha-icon>` : s ? html`<ha-state-icon .hass=${this.hass} .stateObj=${s}></ha-state-icon>` : nothing}</span>
+          <span class="qa-name">${a.name}</span>
+          ${sub ? html`<span class="qa-sub">${sub}</span>` : nothing}
+        </button>`;
+      })}
+    </div>`;
+  }
+
+  private _renderMap() {
+    const c = this._config!;
+    const hass = this.hass!;
+    const [w, h] = c.size;
+    const pos = this._positions;
+    const dark = !!hass.themes?.darkMode;
+    const unit = Math.max(w, h) / 100; // 1% of the longer side, for sizes in plan units
+    const glows: TemplateResult[] = [];
+    const defs: TemplateResult[] = [];
+    const rooms = c.rooms.map((room, i) => {
+      const e = this._roomEntities(room);
+      const points = room.shape.map((p) => p.join(",")).join(" ");
+      defs.push(svg`<clipPath id="room-${i}"><polygon points=${points}></polygon></clipPath>`);
+      const roomGlows = e.lights
+        .filter((s) => s.state === "on" && pos[s.entity_id])
+        .map((s) => {
+          const [x, y] = pos[s.entity_id];
+          const pct = this._pct(s);
+          const [r, g, b] = this._rgb(s);
+          const gid = `glow-${s.entity_id.replace(/\W/g, "_")}`;
+          const a = ((dark ? 0.4 : 0.28) + 0.45 * (pct / 100)).toFixed(2);
+          defs.push(svg`<radialGradient id=${gid}><stop offset="0" stop-color="rgb(${r},${g},${b})" stop-opacity=${a}></stop><stop offset="1" stop-color="rgb(${r},${g},${b})" stop-opacity="0"></stop></radialGradient>`);
+          return svg`<circle cx=${x} cy=${y} r=${(15 + 17 * (pct / 100)) * unit} fill="url(#${gid})"></circle>`;
+        });
+      glows.push(svg`<g clip-path="url(#room-${i})" pointer-events="none">${roomGlows}</g>`);
+      return svg`<polygon class="room ${this._room === room.area ? "selected" : ""}" points=${points}
+        @pointerdown=${(ev: PointerEvent) => this._roomDown(ev, room)}
+        @pointerup=${() => this._roomUp(room)}
+        @pointerleave=${() => this._roomCancel()}
+        @pointercancel=${() => this._roomCancel()}
+        @contextmenu=${(ev: Event) => ev.preventDefault()}></polygon>`;
+    });
+
+    const dots = Object.entries(pos)
+      .filter(([id]) => domainOf(id) === "light" && hass.states[id])
+      .map(([id, [x, y]]) => {
+        const s = hass.states[id];
+        const [r, g, b] = this._rgb(s);
+        const on = s.state === "on";
+        const cls = `dot ${on ? "on" : ""} ${s.state === "unavailable" ? "na" : ""} ${this._arrange ? "drag" : ""}`;
+        return svg`<circle class=${cls} cx=${x} cy=${y} r=${(this._arrange ? 1.6 : 1.1) * unit}
+          style=${on ? `fill: rgb(${r},${g},${b})` : ""}
+          @pointerdown=${(ev: PointerEvent) => this._dragStart(ev, id)}></circle>`;
+      });
+
+    // Non-light devices and the vacuum as HTML icons over the SVG.
+    const vacRoom = this._vacuumRoom();
+    const icons = Object.entries(pos)
+      .filter(([id]) => domainOf(id) !== "light" && hass.states[id])
+      .map(([id, p]) => {
+        const s = hass.states[id];
+        let [x, y] = p;
+        if (id === c.vacuum && vacRoom && !this._arrange) [x, y] = (([lx, ly]) => [lx, ly + 6 * unit])(vacRoom.label ?? this._centroid(vacRoom.shape));
+        const active = id === c.vacuum ? s.state === "cleaning" : !isOff(s);
+        return html`<span class="icon ${active ? "active" : ""} ${id === c.vacuum ? "vacuum" : ""} ${this._arrange ? "drag" : ""}"
+          style="left:${(x / w) * 100}%;top:${(y / h) * 100}%"
+          @pointerdown=${(ev: PointerEvent) => this._dragStart(ev, id)}>
+          <ha-state-icon .hass=${hass} .stateObj=${s}></ha-state-icon>
+        </span>`;
+      });
+
+    const labels = c.rooms.map((room) => {
+      const [x, y] = room.label ?? this._centroid(room.shape);
+      const e = this._roomEntities(room);
+      const on = e.lights.filter((s) => s.state === "on").length;
+      const sub = [on ? `${on} light${on > 1 ? "s" : ""}` : "Off", ...e.media.filter((s) => !isOff(s)).map((s) => `${this._name(s, room)} on`)].join(" · ");
+      return html`<div class="label" style="left:${(x / w) * 100}%;top:${(y / h) * 100}%">
+        <div class="label-name">${this._roomName(room)}</div>
+        <div class="label-sub">${sub}</div>
+      </div>`;
+    });
+
+    return html`<div class="map ${this._arrange ? "arranging" : ""} ${this._placing ? "placing" : ""}" style="aspect-ratio:${w} / ${h}"
+        @pointermove=${(ev: PointerEvent) => this._dragMove(ev)}
+        @pointerup=${() => this._dragEnd()}
+        @pointercancel=${() => this._dragEnd()}>
+      <svg class="plan" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" @pointerdown=${(ev: PointerEvent) => this._mapDown(ev)}>
+        <defs>${defs}</defs>
+        <rect class="walls" x="0" y="0" width=${w} height=${h} rx=${unit * 1.5}></rect>
+        ${rooms}${glows}${dots}
+      </svg>
+      <div class="overlay">${labels}${icons}</div>
+      <button class="arrange-btn" aria-label=${this._arrange ? "Done arranging" : "Arrange devices"} title=${this._arrange ? "Done" : "Arrange devices"}
+        @click=${() => {
+          this._arrange = !this._arrange;
+          this._placing = undefined;
+          this._yaml = undefined;
+          this._room = undefined;
+        }}>
+        <ha-icon .icon=${this._arrange ? "mdi:check" : "mdi:pencil-ruler"}></ha-icon>
+      </button>
+    </div>`;
+  }
+
+  private _renderPills() {
+    return html`<div class="pills">
+      ${this._config!.rooms.map((room) => {
+        const on = this._roomEntities(room).lights.filter((s) => s.state === "on");
+        return html`<button class="pill" @click=${() => (this._room = room.area)}>
+          ${this._roomName(room)}
+          <span class="pill-dots">${on.map((s) => html`<i style="background:rgb(${this._rgb(s).join(",")})"></i>`)}</span>
+        </button>`;
+      })}
+    </div>`;
+  }
+
+  private _renderArrange() {
+    const pos = this._positions;
+    const all = this._placeable();
+    const unplaced = all.filter((p) => !pos[p.id]);
+    const placed = all.filter((p) => pos[p.id]);
+    const dirty = !!this._draft && Object.keys(this._draft).length > 0;
+    const chip = (p: { id: string; name: string; room: string }) =>
+      html`<button class="pill ${this._placing === p.id ? "selected" : ""}" @click=${() => (this._placing = this._placing === p.id ? undefined : p.id)}>
+        ${p.name}${p.room ? html`<span class="pill-room">${p.room}</span>` : nothing}
+      </button>`;
+    return html`<div class="arrange">
+      <div class="hint">
+        ${this._placing
+          ? html`Tap the map where <b>${all.find((p) => p.id === this._placing)?.name}</b> is.`
+          : html`Drag dots and icons to move them. Pick an item below, then tap the map to place it.`}
+      </div>
+      ${unplaced.length ? html`<div class="section">Not on the map</div><div class="wrap">${unplaced.map(chip)}</div>` : nothing}
+      ${placed.length ? html`<div class="section">On the map (pick to move)</div><div class="wrap">${placed.map(chip)}</div>` : nothing}
+      <div class="arrange-actions">
+        <button class="btn primary" ?disabled=${!dirty} @click=${() => this._save()}>Save</button>
+        <button class="btn" @click=${() => this._showYaml()}>Copy as YAML</button>
+        <button class="btn" @click=${() => {
+          this._draft = undefined;
+          this._placing = undefined;
+        }} ?disabled=${!dirty}>Discard</button>
+        <button class="btn" ?disabled=${!this._saved} @click=${() => this._reset()}>Reset to YAML</button>
+      </div>
+      ${this._yaml
+        ? html`<textarea class="yaml" readonly rows="8" .value=${this._yaml} @focus=${(e: Event) => (e.target as HTMLTextAreaElement).select()}></textarea>
+            <div class="hint">Paste into the card's config to keep these positions in git. Saved positions win over YAML until you reset.</div>`
+        : nothing}
+    </div>`;
+  }
+
+  private _renderSheet() {
+    const c = this._config!;
+    const room = c.rooms.find((r) => r.area === this._room);
+    if (!room) return nothing;
+    const hass = this.hass!;
+    const e = this._roomEntities(room);
+    const group = room.light ? hass.states[room.light] : undefined;
+    const groupPct = group ? this._pct(group) : 0;
+    const vac = c.vacuum ? hass.states[c.vacuum] : undefined;
+    const cleaningHere = !!vac && vac.state === "cleaning" && this._vacuumRoom()?.area === room.area;
+    const close = () => (this._room = undefined);
+    const tileRef = (entity: string, name: string) =>
+      ref((el?: Element) => {
+        const t = el as (HTMLElement & { setConfig(c: unknown): void; _dgKey?: string }) | undefined;
+        if (t && t._dgKey !== entity + name) {
+          t.setConfig({ type: "custom:dg-light-tile", entity, name });
+          t._dgKey = entity + name;
+        }
+      });
+
+    return html`<div class="scrim" @click=${close}></div>
+      <div class="sheet" role="dialog" aria-label=${this._roomName(room)} @keydown=${(ev: KeyboardEvent) => ev.key === "Escape" && close()}>
+        <div class="grabber"></div>
+        <div class="sheet-head">
+          <h2>${this._roomName(room)}</h2>
+          <button class="round" aria-label="Close" @click=${close}><ha-icon icon="mdi:close"></ha-icon></button>
+        </div>
+        ${e.chips.length
+          ? html`<div class="chips">
+              ${e.chips.map(
+                (s) => html`<button class="chip" @click=${() => fireMoreInfo(this, s.entity_id)}>
+                  <ha-state-icon .hass=${hass} .stateObj=${s}></ha-state-icon>${this._state(s)}
+                </button>`,
+              )}
+            </div>`
+          : nothing}
+
+        ${vac
+          ? html`<div class="row card">
+              <span class="row-icon ${vac.state === "cleaning" ? "green" : ""}"><ha-state-icon .hass=${hass} .stateObj=${vac}></ha-state-icon></span>
+              <span class="row-text">
+                <span class="row-name">${this._name(vac)}</span>
+                <span class="row-sub">${room.clean ? (cleaningHere ? `Cleaning ${this._roomName(room).toLowerCase()}` : this._state(vac)) : "This room isn't on the map"}</span>
+              </span>
+              ${room.clean
+                ? cleaningHere
+                  ? html`<button class="btn" @click=${() => this._call("vacuum", "return_to_base", { entity_id: vac.entity_id })}>Stop</button>`
+                  : html`<button class="btn primary" @click=${() => this._call("vacuum", "clean_area", { entity_id: vac.entity_id, cleaning_area_id: [room.area] })}>Clean this room</button>`
+                : nothing}
+            </div>`
+          : nothing}
+
+        ${group || e.lights.length
+          ? html`<h3>Lights</h3>
+              ${group
+                ? html`<div class="row card">
+                    <button class="round big ${groupPct ? "lit" : ""}" aria-label="Toggle all lights" @click=${() => this._call("light", "toggle", { entity_id: group.entity_id })}>
+                      <ha-icon icon="mdi:lightbulb-group"></ha-icon>
+                    </button>
+                    <span class="row-text">
+                      <span class="row-line"><span class="row-name">All lights</span><span class="row-sub">${groupPct ? `${groupPct}%` : "Off"}</span></span>
+                      <input type="range" min="1" max="100" .value=${String(groupPct || 50)} aria-label="Room brightness"
+                        @change=${(ev: Event) => this._call("light", "turn_on", { entity_id: group.entity_id, brightness_pct: Number((ev.target as HTMLInputElement).value) })} />
+                    </span>
+                  </div>`
+                : nothing}
+              <div class="grid">${e.lights.map((s) => html`<dg-light-tile .hass=${hass} ${tileRef(s.entity_id, this._name(s, room))}></dg-light-tile>`)}</div>`
+          : nothing}
+
+        ${e.scenes.length
+          ? html`<h3>Scenes</h3>
+              <div class="chips scroll">
+                ${e.scenes.map((s) => html`<button class="chip scene" @click=${() => this._call("scene", "turn_on", { entity_id: s.entity_id })}>
+                  <ha-icon icon="mdi:palette-outline"></ha-icon>${this._name(s, room)}
+                </button>`)}
+              </div>`
+          : nothing}
+
+        ${e.media.length
+          ? html`<h3>Media</h3>
+              <div class="list">
+                ${e.media.map((s) => {
+                  const na = s.state === "unavailable";
+                  const title = s.attributes.media_title ?? s.attributes.app_name ?? s.attributes.source;
+                  return html`<div class="row card ${na ? "na" : ""} ${!isOff(s) ? "media-on" : ""}">
+                    <button class="row-main" @click=${() => fireMoreInfo(this, s.entity_id)}>
+                      <span class="row-icon"><ha-state-icon .hass=${hass} .stateObj=${s}></ha-state-icon></span>
+                      <span class="row-text">
+                        <span class="row-name">${this._name(s, room)}</span>
+                        <span class="row-sub">${this._state(s)}${title && !isOff(s) ? ` · ${title}` : ""}</span>
+                      </span>
+                    </button>
+                    ${!na && (s.state === "playing" || s.state === "paused")
+                      ? html`<button class="round" aria-label="Play or pause" @click=${() => this._call("media_player", "media_play_pause", { entity_id: s.entity_id })}>
+                          <ha-icon icon=${s.state === "playing" ? "mdi:pause" : "mdi:play"}></ha-icon>
+                        </button>`
+                      : nothing}
+                    ${!na
+                      ? html`<button class="round" aria-label="Power" @click=${() => this._call("media_player", "toggle", { entity_id: s.entity_id })}>
+                          <ha-icon icon="mdi:power"></ha-icon>
+                        </button>`
+                      : nothing}
+                  </div>`;
+                })}
+              </div>`
+          : nothing}
+
+        ${e.devices.length
+          ? html`<h3>Devices</h3>
+              <div class="grid">
+                ${e.devices.map((s) => {
+                  const na = s.state === "unavailable";
+                  return html`<button class="tile ${!isOff(s) ? "on" : ""} ${na ? "na" : ""}"
+                    @click=${() => this._toggleEntity(s)}
+                    @contextmenu=${(ev: Event) => {
+                      ev.preventDefault();
+                      fireMoreInfo(this, s.entity_id);
+                    }}>
+                    <span class="row-icon"><ha-state-icon .hass=${hass} .stateObj=${s}></ha-state-icon></span>
+                    <span class="row-text"><span class="row-name">${this._name(s, room)}</span><span class="row-sub">${this._state(s)}</span></span>
+                  </button>`;
+                })}
+              </div>`
+          : nothing}
+      </div>`;
+  }
+
+  static styles = css`
+    :host {
+      display: block;
+      --fp-bg: var(--ha-card-background, var(--card-background-color, #fff));
+      --fp-surface: var(--secondary-background-color, #e5e5ea);
+      --fp-accent: var(--primary-color, #ff9f0a);
+    }
+    ha-card {
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    button {
+      font: inherit;
+      color: inherit;
+      border: none;
+      background: none;
+      padding: 0;
+      cursor: pointer;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .summary {
+      color: var(--secondary-text-color);
+      font-size: 14px;
+    }
+    .quick {
+      display: grid;
+      gap: 8px;
+    }
+    .qa {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 4px;
+      padding: 10px;
+      border-radius: 18px;
+      background: var(--fp-surface);
+      text-align: left;
+      min-height: 84px;
+      transition: transform 120ms ease;
+    }
+    .qa:active,
+    .pill:active,
+    .chip:active,
+    .tile:active {
+      transform: scale(0.96);
+    }
+    .qa-icon {
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      background: var(--fp-bg);
+      color: var(--secondary-text-color);
+      --mdc-icon-size: 20px;
+      margin-bottom: 4px;
+    }
+    .qa.active .qa-icon {
+      background: var(--fp-accent);
+      color: #1c1c1e;
+    }
+    .qa-name {
+      font-size: 13px;
+      font-weight: 600;
+      line-height: 1.2;
+    }
+    .qa-sub {
+      font-size: 12px;
+      color: var(--secondary-text-color);
+    }
+    .map {
+      position: relative;
+      width: 100%;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    .map.arranging {
+      touch-action: none;
+    }
+    svg.plan {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      overflow: visible;
+    }
+    .walls {
+      fill: var(--secondary-text-color);
+      opacity: 0.35;
+    }
+    .room {
+      fill: var(--fp-bg);
+      cursor: pointer;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .room.selected {
+      stroke: var(--fp-accent);
+      stroke-width: 6;
+    }
+    .placing .room,
+    .placing svg {
+      cursor: crosshair;
+    }
+    .dot {
+      fill: none;
+      stroke: var(--secondary-text-color);
+      stroke-width: 3;
+      pointer-events: none;
+    }
+    .dot.on {
+      stroke: var(--fp-bg);
+    }
+    .dot.na {
+      stroke-dasharray: 4 4;
+    }
+    .dot.drag {
+      pointer-events: all;
+      cursor: grab;
+      stroke: var(--fp-accent);
+      stroke-width: 4;
+    }
+    .overlay {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+    }
+    .label {
+      position: absolute;
+      transform: translate(-50%, -50%);
+      text-align: center;
+      white-space: nowrap;
+    }
+    .label-name {
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: -0.2px;
+    }
+    .label-sub {
+      font-size: 11px;
+      color: var(--secondary-text-color);
+    }
+    .icon {
+      position: absolute;
+      transform: translate(-50%, -50%);
+      width: 26px;
+      height: 26px;
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      background: var(--fp-bg);
+      color: var(--secondary-text-color);
+      box-shadow: 0 0 0 0.5px var(--divider-color, rgba(0, 0, 0, 0.12));
+      --mdc-icon-size: 16px;
+      transition: left 1s ease, top 1s ease;
+    }
+    .icon.active {
+      background: var(--fp-accent);
+      color: #1c1c1e;
+    }
+    .icon.vacuum.active {
+      background: var(--success-color, #34c759);
+      color: #fff;
+    }
+    .icon.drag {
+      pointer-events: all;
+      cursor: grab;
+      box-shadow: 0 0 0 2px var(--fp-accent);
+    }
+    .arrange-btn {
+      position: absolute;
+      right: 6px;
+      bottom: 6px;
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      background: var(--fp-bg);
+      color: var(--secondary-text-color);
+      display: grid;
+      place-items: center;
+      --mdc-icon-size: 18px;
+      opacity: 0.8;
+    }
+    .arranging .arrange-btn {
+      background: var(--fp-accent);
+      color: #1c1c1e;
+      opacity: 1;
+    }
+    .pills,
+    .chips.scroll {
+      display: flex;
+      gap: 8px;
+      overflow-x: auto;
+      scrollbar-width: none;
+      margin: 0 -14px;
+      padding: 0 14px;
+    }
+    .pill {
+      flex: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      height: 36px;
+      padding: 0 14px;
+      border-radius: 999px;
+      background: var(--fp-surface);
+      font-size: 13px;
+      font-weight: 500;
+    }
+    .pill.selected {
+      background: var(--fp-accent);
+      color: #1c1c1e;
+    }
+    .pill-dots {
+      display: inline-flex;
+    }
+    .pill-dots i {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      margin-left: 2px;
+    }
+    .pill-room {
+      font-size: 11px;
+      color: var(--secondary-text-color);
+    }
+    .arrange {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .hint,
+    .section {
+      font-size: 13px;
+      color: var(--secondary-text-color);
+    }
+    .wrap {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .arrange-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 4px;
+    }
+    .btn {
+      height: 36px;
+      padding: 0 14px;
+      border-radius: 999px;
+      background: var(--fp-surface);
+      font-size: 13px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+    .btn.primary {
+      background: var(--fp-accent);
+      color: #1c1c1e;
+    }
+    .btn:disabled {
+      opacity: 0.4;
+      cursor: default;
+    }
+    .yaml {
+      width: 100%;
+      box-sizing: border-box;
+      font: 12px ui-monospace, monospace;
+      border-radius: 12px;
+      border: 1px solid var(--divider-color);
+      background: var(--fp-surface);
+      color: var(--primary-text-color);
+      padding: 8px;
+    }
+    .scrim {
+      position: fixed;
+      inset: 0;
+      z-index: 100;
+      background: rgba(0, 0, 0, 0.35);
+    }
+    .sheet {
+      position: fixed;
+      z-index: 101;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      max-height: 88vh;
+      overflow-y: auto;
+      overscroll-behavior: contain;
+      box-sizing: border-box;
+      padding: 8px 16px calc(24px + env(safe-area-inset-bottom));
+      border-radius: 28px 28px 0 0;
+      background: var(--primary-background-color, #f2f2f7);
+      color: var(--primary-text-color);
+      animation: up 220ms ease;
+    }
+    @media (min-width: 700px) {
+      .sheet {
+        left: 50%;
+        right: auto;
+        width: 520px;
+        transform: translateX(-50%);
+        bottom: 24px;
+        border-radius: 28px;
+        animation: none;
+      }
+    }
+    @keyframes up {
+      from {
+        transform: translateY(40%);
+        opacity: 0;
+      }
+    }
+    .grabber {
+      width: 36px;
+      height: 5px;
+      border-radius: 3px;
+      background: var(--divider-color, rgba(0, 0, 0, 0.2));
+      margin: 0 auto 12px;
+    }
+    .sheet-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    h2 {
+      margin: 0;
+      font-size: 22px;
+      font-weight: 600;
+      letter-spacing: -0.4px;
+    }
+    h3 {
+      margin: 18px 0 8px;
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--secondary-text-color);
+    }
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 10px;
+    }
+    .chips.scroll {
+      flex-wrap: nowrap;
+      margin: 0 -16px;
+      padding: 0 16px;
+    }
+    .chip {
+      flex: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 6px 12px;
+      border-radius: 999px;
+      background: var(--fp-bg);
+      font-size: 13px;
+      --mdc-icon-size: 16px;
+      color: var(--secondary-text-color);
+    }
+    .chip.scene {
+      color: var(--primary-text-color);
+      font-weight: 500;
+      height: 36px;
+      box-sizing: border-box;
+    }
+    .card {
+      background: var(--fp-bg);
+      border-radius: 18px;
+    }
+    .row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 12px;
+      margin-top: 14px;
+    }
+    h3 + .row,
+    .list .row {
+      margin-top: 0;
+    }
+    .list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .row-main {
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      text-align: left;
+    }
+    .row-icon {
+      flex: none;
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      background: var(--fp-surface);
+      color: var(--secondary-text-color);
+      --mdc-icon-size: 20px;
+    }
+    .row-icon.green {
+      background: var(--success-color, #34c759);
+      color: #fff;
+    }
+    .row-text {
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+    }
+    .row-line {
+      display: flex;
+      justify-content: space-between;
+    }
+    .row-name {
+      font-size: 14px;
+      font-weight: 600;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .row-sub {
+      font-size: 12px;
+      color: var(--secondary-text-color);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .media-on {
+      background: rgba(255, 159, 10, 0.16);
+    }
+    .round {
+      flex: none;
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      background: var(--fp-surface);
+      display: grid;
+      place-items: center;
+      --mdc-icon-size: 20px;
+    }
+    .round.big {
+      width: 44px;
+      height: 44px;
+    }
+    .round.lit {
+      background: var(--fp-accent);
+      color: #1c1c1e;
+    }
+    input[type="range"] {
+      width: 100%;
+      accent-color: var(--fp-accent);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 8px;
+    }
+    h3 + .grid {
+      margin-top: 0;
+    }
+    .grid dg-light-tile {
+      height: 104px;
+    }
+    .tile {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 12px;
+      min-height: 64px;
+      border-radius: 18px;
+      background: var(--fp-bg);
+      text-align: left;
+      transition: transform 120ms ease;
+    }
+    .tile.on .row-icon {
+      background: var(--fp-accent);
+      color: #1c1c1e;
+    }
+    .na {
+      opacity: 0.5;
+    }
+  `;
+}
+
+if (!customElements.get(TAG)) customElements.define(TAG, FloorPlanCard);
+
+registerCard({
+  type: TAG,
+  name: "Floor plan",
+  description: "Home floor plan: rooms glow with their lights, tap a room for everything in it, quick actions on top.",
+});
+
+declare global {
+  interface HTMLElementTagNameMap {
+    [TAG]: FloorPlanCard;
+  }
+}

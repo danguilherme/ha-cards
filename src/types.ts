@@ -10,9 +10,35 @@ export interface HassEntity {
   };
 }
 
+export interface EntityRegistryDisplayEntry {
+  entity_id: string;
+  name?: string | null;
+  device_id?: string | null;
+  area_id?: string | null;
+  hidden?: boolean;
+  entity_category?: "config" | "diagnostic" | null;
+}
+
+export interface DeviceRegistryEntry {
+  id: string;
+  area_id?: string | null;
+  name?: string | null;
+}
+
+export interface AreaRegistryEntry {
+  area_id: string;
+  name: string;
+}
+
 export interface HomeAssistant {
   states: Record<string, HassEntity>;
+  entities?: Record<string, EntityRegistryDisplayEntry>;
+  devices?: Record<string, DeviceRegistryEntry>;
+  areas?: Record<string, AreaRegistryEntry>;
+  themes?: { darkMode?: boolean };
   callService(domain: string, service: string, data?: Record<string, unknown>): Promise<unknown>;
+  callWS?<T>(msg: Record<string, unknown>): Promise<T>;
+  formatEntityState?(stateObj: HassEntity, state?: string): string;
   locale?: { language: string };
 }
 

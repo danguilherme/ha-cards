@@ -25,6 +25,56 @@ icon: mdi:ceiling-light # optional, defaults to HA's state icon
 
 In a sections view it takes half the width and two rows, the same footprint as a vertical tile.
 
+### `custom:dg-floor-plan`
+
+The home as a floor plan, made for phones.
+
+- **Quick actions** on top (scenes, scripts, a vacuum, anything toggleable).
+- **Rooms glow with their lights**: every positioned bulb that's on glows in its own colour and
+  brightness, clipped to its room, so a room with a warm ceiling light and a purple lamp shows both.
+  Media players, sensors and the vacuum show as icons; the vacuum moves to the room it's cleaning.
+- **Tap a room** for a sheet with everything assigned to its HA area (directly or through the device):
+  sensor chips, a vacuum card with "Clean this room" (`vacuum.clean_area`), the room's light group with
+  a slider plus a `dg-light-tile` per bulb, scenes, media players and other devices (switches, covers,
+  fans…). Hidden entities, config/diagnostic entities, light groups and the vacuum's own entities are
+  left out.
+- **Hold a room** to toggle its light group.
+- **Arrange mode** (pencil button on the map): drag dots and icons to where the devices really are, or
+  pick an unplaced device and tap the map. **Save** stores the layout per HA user
+  (`frontend/set_user_data`), so it follows you across devices right away. **Copy as YAML** gives a
+  `positions:` block to paste into the card config; saved positions win over YAML until you **Reset**.
+
+```yaml
+type: custom:dg-floor-plan
+size: [985, 745]            # plan size in your own units (e.g. cm)
+vacuum: vacuum.monica       # optional
+vacuum_room_sensor: sensor.monica_current_room  # optional: moves the vacuum icon while cleaning
+quick_actions:
+  - name: Lights off
+    entity: scene.all_lights_off   # scene/script → turn_on, vacuum → start/dock, else → toggle
+    icon: mdi:lightbulb-group-off
+  - name: Party
+    action: script.turn_on         # or any domain.service
+    data: { entity_id: script.party }
+rooms:
+  - area: living_room              # HA area id
+    name: Living room              # optional, defaults to the area name
+    shape: [[37, 37], [485, 37], [485, 435], [37, 435]]   # polygon, plan units
+    label: [261, 270]              # optional, defaults to the shape's centre
+    light: light.all_living_room_lights  # optional: hold to toggle, slider in the sheet
+    clean: true                    # optional: show "Clean this room" (vacuum.clean_area)
+    vacuum_room: Living room       # optional: name in vacuum_room_sensor, if different
+    exclude: [media_player.old_tv] # optional
+positions:                         # optional defaults, plan units
+  light.living_room_ceiling: [250, 200]
+  vacuum.monica: [115, 105]        # the dock
+```
+
+"Clean this room" calls `vacuum.clean_area` with the room's area, so the vacuum needs its map segments
+mapped to HA areas.
+
+Preview with mocked data: `yarn dev`, then <http://localhost:5173/preview/floor-plan.html>.
+
 ## Install (Marketplace)
 
 1. Settings → **Marketplace**. The first time, accept the community-code notice.

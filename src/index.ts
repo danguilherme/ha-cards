@@ -1,4 +1,5 @@
 import "./light-tile-card";
+import "./floor-plan-card";
 
 declare const __VERSION__: string;
 
