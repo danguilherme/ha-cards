@@ -644,8 +644,10 @@ export class FloorPlanCard extends LitElement {
     if (zoom) {
       const xs = zoom.shape.map((p) => p[0]);
       const ys = zoom.shape.map((p) => p[1]);
-      const pad = 3 * unit;
-      const [x0, x1, y0, y1] = [Math.min(...xs) - pad, Math.max(...xs) + pad, Math.min(...ys) - pad, Math.max(...ys) + pad];
+      // Room for the controls around devices near a wall: icons reach above their point, names hang
+      // below it and spread sideways, so the bottom and sides get more margin than the top.
+      const [padTop, padSide, padBottom] = [4 * unit, 5 * unit, 8 * unit];
+      const [x0, x1, y0, y1] = [Math.min(...xs) - padSide, Math.max(...xs) + padSide, Math.min(...ys) - padTop, Math.max(...ys) + padBottom];
       const k = Math.min(w / (x1 - x0), h / (y1 - y0), 3.2);
       const clamp = (v: number) => Math.min(0, Math.max((1 - k) * 100, v));
       const tx = clamp((0.5 - (k * (x0 + x1)) / 2 / w) * 100);
