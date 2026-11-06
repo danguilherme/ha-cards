@@ -60,7 +60,9 @@ const CHIP_SENSORS: Record<string, string[]> = {
 };
 const DEVICE_DOMAINS = ["switch", "input_boolean", "fan", "cover", "climate", "lock", "humidifier", "valve", "siren", "water_heater"];
 const TOGGLE_DOMAINS = ["switch", "input_boolean", "fan", "cover", "lock", "humidifier", "valve", "siren", "light"];
-const PLACEABLE_DOMAINS = ["light", "media_player", "vacuum", "binary_sensor", ...DEVICE_DOMAINS];
+const PLACEABLE_DOMAINS = ["light", "media_player", "vacuum", "fan", "cover", "climate", "lock", "humidifier", "valve", "water_heater"];
+const PLACEABLE_SENSORS = ["door", "window", "opening", "garage_door", "motion", "occupancy", "presence", "moisture", "smoke"];
+const DRAG_SLOP_PX = 4;
 
 interface RoomEntities {
   lights: HassEntity[];
@@ -86,7 +88,7 @@ export class FloorPlanCard extends LitElement {
     _arrange: { state: true },
     _saved: { state: true },
     _draft: { state: true },
-    _placing: { state: true },
+    _selected: { state: true },
     _yaml: { state: true },
     _dragging: { state: true },
     _pressing: { state: true },
@@ -96,15 +98,17 @@ export class FloorPlanCard extends LitElement {
   private declare _config?: FloorPlanConfig;
   private declare _room?: string;
   private declare _arrange: boolean;
-  private declare _saved?: Record<string, Point>;
-  private declare _draft?: Record<string, Point>;
-  private declare _placing?: string;
+  private declare _saved?: Record<string, Point | null>;
+  // null = removed from the map (overrides a YAML default until saved positions are reset).
+  private declare _draft?: Record<string, Point | null>;
+  private declare _selected?: string;
   private declare _yaml?: string;
   private declare _dragging?: string;
   private declare _pressing?: string;
 
   private _loadedLayout = false;
   private _hold?: { timer: number; fired: boolean };
+  private _dragFrom?: { x: number; y: number; moved: boolean };
 
   constructor() {
     super();
@@ -173,7 +177,7 @@ export class FloorPlanCard extends LitElement {
     if (!this._loadedLayout && this.hass?.callWS) {
       this._loadedLayout = true;
       this.hass
-        .callWS<{ value: Record<string, Point> | null }>({ type: "frontend/get_user_data", key: this._layoutKey })
+        .callWS<{ value: Record<string, Point | null> | null }>({ type: "frontend/get_user_data", key: this._layoutKey })
         .then((r) => (this._saved = r?.value ?? undefined))
         .catch(() => undefined);
     }
@@ -184,8 +188,10 @@ export class FloorPlanCard extends LitElement {
   }
 
   private get _positions(): Record<string, Point> {
-    return { ...(this._config?.positions ?? {}), ...(this._saved ?? {}), ...(this._draft ?? {}) };
+    const merged = { ...(this._config?.positions ?? {}), ...(this._saved ?? {}), ...(this._draft ?? {}) };
+    return Object.fromEntries(Object.entries(merged).filter((e): e is [string, Point] => Array.isArray(e[1])));
   }
+
 
   // --- registry helpers ---------------------------------------------------------------------------
 
@@ -347,37 +353,47 @@ export class FloorPlanCard extends LitElement {
   }
 
   private _mapDown(ev: PointerEvent): void {
-    if (!this._arrange || !this._placing) return;
-    const p = this._toPlan(ev);
-    if (!p) return;
-    this._draft = { ...(this._draft ?? {}), [this._placing]: p };
-    this._placing = undefined;
+    // Tapping empty map in arrange mode just clears the selection.
+    if (this._arrange) this._selected = undefined;
   }
 
   private _dragStart(ev: PointerEvent, id: string): void {
     if (!this._arrange) return;
     ev.stopPropagation();
-    (ev.currentTarget as Element).setPointerCapture?.(ev.pointerId);
+    ev.preventDefault();
     this._dragging = id;
-    this._placing = undefined;
+    this._selected = id;
+    this._dragFrom = { x: ev.clientX, y: ev.clientY, moved: false };
+    try {
+      (ev.currentTarget as Element).setPointerCapture(ev.pointerId);
+    } catch {
+      // No capture (e.g. synthetic events): moves still reach the map's pointermove.
+    }
   }
 
   private _dragMove(ev: PointerEvent): void {
-    if (!this._dragging) return;
+    if (!this._dragging || !this._dragFrom) return;
+    if (!this._dragFrom.moved && Math.hypot(ev.clientX - this._dragFrom.x, ev.clientY - this._dragFrom.y) < DRAG_SLOP_PX) return;
+    this._dragFrom.moved = true;
     const p = this._toPlan(ev);
     if (p) this._draft = { ...(this._draft ?? {}), [this._dragging]: p };
   }
 
   private _dragEnd(): void {
     this._dragging = undefined;
+    this._dragFrom = undefined;
   }
 
   private _placeable(): { id: string; name: string; room: string }[] {
     const out: { id: string; name: string; room: string }[] = [];
+    const ok = (s: HassEntity) => {
+      const d = domainOf(s.entity_id);
+      return PLACEABLE_DOMAINS.includes(d) || (d === "binary_sensor" && PLACEABLE_SENSORS.includes(String(s.attributes.device_class)));
+    };
     for (const room of this._config!.rooms) {
       const e = this._roomEntities(room);
       for (const s of [...e.lights, ...e.media, ...e.devices, ...e.chips]) {
-        if (PLACEABLE_DOMAINS.includes(domainOf(s.entity_id))) out.push({ id: s.entity_id, name: this._name(s, room), room: this._roomName(room) });
+        if (ok(s)) out.push({ id: s.entity_id, name: this._name(s, room), room: this._roomName(room) });
       }
     }
     const v = this._config!.vacuum;
@@ -390,17 +406,56 @@ export class FloorPlanCard extends LitElement {
     return out;
   }
 
-  private async _save(): Promise<void> {
-    const value = { ...(this._saved ?? {}), ...(this._draft ?? {}) };
-    await this.hass?.callWS?.({ type: "frontend/set_user_data", key: this._layoutKey, value });
-    this._saved = value;
+  /** Drops an unplaced item in the middle of its room and selects it, so the next move is a drag. */
+  private _add(item: { id: string; room: string }): void {
+    const room = this._config!.rooms.find((r) => this._roomName(r) === item.room);
+    const [w, h] = this._config!.size;
+    const p = room ? (room.label ?? this._centroid(room.shape)) : ([w / 2, h / 2] as Point);
+    const unit = Math.max(w, h) / 100;
+    this._draft = { ...(this._draft ?? {}), [item.id]: [Math.round(p[0]), Math.round(p[1] + 7 * unit)] };
+    this._selected = item.id;
+    this.renderRoot.querySelector(".map")?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }
+
+  private _remove(id: string): void {
+    this._draft = { ...(this._draft ?? {}), [id]: null };
+    this._selected = undefined;
+  }
+
+  private get _dirty(): boolean {
+    return !!this._draft && Object.keys(this._draft).length > 0;
+  }
+
+  private _enterArrange(): void {
+    this._arrange = true;
+    this._room = undefined;
+    this._selected = undefined;
+    this._yaml = undefined;
     this._draft = undefined;
   }
 
+  private _exitArrange(): void {
+    this._arrange = false;
+    this._selected = undefined;
+    this._yaml = undefined;
+    this._draft = undefined;
+  }
+
+  private async _save(): Promise<void> {
+    if (this._dirty) {
+      const value = { ...(this._saved ?? {}), ...(this._draft ?? {}) };
+      await this.hass?.callWS?.({ type: "frontend/set_user_data", key: this._layoutKey, value });
+      this._saved = value;
+    }
+    this._exitArrange();
+  }
+
   private async _reset(): Promise<void> {
+    if (!confirm("Put every device back where the dashboard config places it? Your saved positions are removed.")) return;
     await this.hass?.callWS?.({ type: "frontend/set_user_data", key: this._layoutKey, value: null });
     this._saved = undefined;
     this._draft = undefined;
+    this._selected = undefined;
   }
 
   private _showYaml(): void {
@@ -430,8 +485,14 @@ export class FloorPlanCard extends LitElement {
 
     return html`
       <ha-card>
-        ${c.hide_summary ? nothing : html`<div class="summary">${summary}</div>`}
-        ${c.quick_actions?.length ? this._renderQuick(c.quick_actions) : nothing}
+        ${this._arrange
+          ? html`<div class="arrange-bar">
+              <button class="btn" @click=${() => this._exitArrange()}>Cancel</button>
+              <div class="arrange-title">Place devices</div>
+              <button class="btn primary" @click=${() => this._save()}>${this._dirty ? "Save" : "Done"}</button>
+            </div>`
+          : html`${c.hide_summary ? nothing : html`<div class="summary">${summary}</div>`}
+              ${c.quick_actions?.length ? this._renderQuick(c.quick_actions) : nothing}`}
         ${this._renderMap()}
         ${this._arrange ? this._renderArrange() : this._renderPills()}
       </ha-card>
@@ -479,7 +540,7 @@ export class FloorPlanCard extends LitElement {
           defs.push(svg`<radialGradient id=${gid}><stop offset="0" stop-color="rgb(${r},${g},${b})" stop-opacity=${a}></stop><stop offset="1" stop-color="rgb(${r},${g},${b})" stop-opacity="0"></stop></radialGradient>`);
           return svg`<circle cx=${x} cy=${y} r=${(15 + 17 * (pct / 100)) * unit} fill="url(#${gid})"></circle>`;
         });
-      glows.push(svg`<g clip-path="url(#room-${i})" pointer-events="none">${roomGlows}</g>`);
+      if (!this._arrange) glows.push(svg`<g clip-path="url(#room-${i})" pointer-events="none">${roomGlows}</g>`);
       return svg`<polygon class="room ${this._room === room.area ? "selected" : ""} ${this._pressing === room.area ? "pressing" : ""}" points=${points}
         @pointerdown=${(ev: PointerEvent) => this._roomDown(ev, room)}
         @pointerup=${() => this._roomUp()}
@@ -490,30 +551,44 @@ export class FloorPlanCard extends LitElement {
     });
 
     const dots = Object.entries(pos)
-      .filter(([id]) => domainOf(id) === "light" && hass.states[id])
+      .filter(([id]) => !this._arrange && domainOf(id) === "light" && hass.states[id])
       .map(([id, [x, y]]) => {
         const s = hass.states[id];
         const [r, g, b] = this._rgb(s);
         const on = s.state === "on";
-        const cls = `dot ${on ? "on" : ""} ${s.state === "unavailable" ? "na" : ""} ${this._arrange ? "drag" : ""}`;
-        return svg`<circle class=${cls} cx=${x} cy=${y} r=${(this._arrange ? 1.6 : 1.1) * unit}
-          style=${on ? `fill: rgb(${r},${g},${b})` : ""}
-          @pointerdown=${(ev: PointerEvent) => this._dragStart(ev, id)}></circle>`;
+        const cls = `dot ${on ? "on" : ""} ${s.state === "unavailable" ? "na" : ""}`;
+        return svg`<circle class=${cls} cx=${x} cy=${y} r=${1.1 * unit} style=${on ? `fill: rgb(${r},${g},${b})` : ""}></circle>`;
       });
 
     // Non-light devices and the vacuum as HTML icons over the SVG.
     const vacRoom = this._vacuumRoom();
     const icons = Object.entries(pos)
-      .filter(([id]) => domainOf(id) !== "light" && hass.states[id])
+      .filter(([id]) => !this._arrange && domainOf(id) !== "light" && hass.states[id])
       .map(([id, p]) => {
         const s = hass.states[id];
         let [x, y] = p;
         if (id === c.vacuum && vacRoom && !this._arrange) [x, y] = (([lx, ly]) => [lx, ly + 6 * unit])(vacRoom.label ?? this._centroid(vacRoom.shape));
         const active = id === c.vacuum ? s.state === "cleaning" : !isOff(s);
-        return html`<span class="icon ${active ? "active" : ""} ${id === c.vacuum ? "vacuum" : ""} ${this._arrange ? "drag" : ""}"
-          style="left:${(x / w) * 100}%;top:${(y / h) * 100}%"
+        return html`<span class="icon ${active ? "active" : ""} ${id === c.vacuum ? "vacuum" : ""}"
+          style="left:${(x / w) * 100}%;top:${(y / h) * 100}%">
+          <ha-state-icon .hass=${hass} .stateObj=${s}></ha-state-icon>
+        </span>`;
+      });
+
+    const names = this._arrange ? new Map(this._placeable().map((p) => [p.id, p.name])) : undefined;
+    const handles = Object.entries(pos)
+      .filter(([id]) => this._arrange && hass.states[id])
+      .map(([id, [x, y]]) => {
+        const s = hass.states[id];
+        const light = domainOf(id) === "light";
+        const ring = light && s.state === "on" ? `--ring: rgb(${this._rgb(s).join(",")})` : "";
+        const sel = this._selected === id;
+        const below = y / h < 0.18;
+        return html`<span class="handle ${sel ? "selected" : ""} ${this._dragging === id ? "dragging" : ""}"
+          style="left:${(x / w) * 100}%;top:${(y / h) * 100}%;${ring}"
           @pointerdown=${(ev: PointerEvent) => this._dragStart(ev, id)}>
           <ha-state-icon .hass=${hass} .stateObj=${s}></ha-state-icon>
+          ${sel ? html`<span class="tag ${below ? "below" : ""}">${names?.get(id) ?? this._name(s)}</span>` : nothing}
         </span>`;
       });
 
@@ -528,7 +603,7 @@ export class FloorPlanCard extends LitElement {
       </div>`;
     });
 
-    return html`<div class="map ${this._arrange ? "arranging" : ""} ${this._placing ? "placing" : ""}" style="aspect-ratio:${w} / ${h}"
+    return html`<div class="map ${this._arrange ? "arranging" : ""}" style="aspect-ratio:${w} / ${h}"
         @pointermove=${(ev: PointerEvent) => this._dragMove(ev)}
         @pointerup=${() => this._dragEnd()}
         @pointercancel=${() => this._dragEnd()}>
@@ -537,16 +612,12 @@ export class FloorPlanCard extends LitElement {
         <rect class="walls" x="0" y="0" width=${w} height=${h} rx=${unit * 1.5}></rect>
         ${rooms}${glows}${dots}
       </svg>
-      <div class="overlay">${labels}${icons}</div>
-      <button class="arrange-btn" aria-label=${this._arrange ? "Done arranging" : "Arrange devices"} title=${this._arrange ? "Done" : "Arrange devices"}
-        @click=${() => {
-          this._arrange = !this._arrange;
-          this._placing = undefined;
-          this._yaml = undefined;
-          this._room = undefined;
-        }}>
-        <ha-icon .icon=${this._arrange ? "mdi:check" : "mdi:pencil-ruler"}></ha-icon>
-      </button>
+      <div class="overlay">${labels}${icons}${handles}</div>
+      ${this._arrange
+        ? nothing
+        : html`<button class="arrange-btn" aria-label="Place devices on the map" title="Place devices on the map" @click=${() => this._enterArrange()}>
+            <ha-icon icon="mdi:cursor-move"></ha-icon>
+          </button>`}
     </div>`;
   }
 
@@ -565,33 +636,39 @@ export class FloorPlanCard extends LitElement {
   private _renderArrange() {
     const pos = this._positions;
     const all = this._placeable();
+    const sel = this._selected ? all.find((p) => p.id === this._selected) : undefined;
+    const selState = sel ? this.hass!.states[sel.id] : undefined;
     const unplaced = all.filter((p) => !pos[p.id]);
-    const placed = all.filter((p) => pos[p.id]);
-    const dirty = !!this._draft && Object.keys(this._draft).length > 0;
-    const chip = (p: { id: string; name: string; room: string }) =>
-      html`<button class="pill ${this._placing === p.id ? "selected" : ""}" @click=${() => (this._placing = this._placing === p.id ? undefined : p.id)}>
-        ${p.name}${p.room ? html`<span class="pill-room">${p.room}</span>` : nothing}
-      </button>`;
+    const byRoom = new Map<string, typeof unplaced>();
+    for (const p of unplaced) byRoom.set(p.room || "Other", [...(byRoom.get(p.room || "Other") ?? []), p]);
     return html`<div class="arrange">
-      <div class="hint">
-        ${this._placing
-          ? html`Tap the map where <b>${all.find((p) => p.id === this._placing)?.name}</b> is.`
-          : html`Drag dots and icons to move them. Pick an item below, then tap the map to place it.`}
-      </div>
-      ${unplaced.length ? html`<div class="section">Not on the map</div><div class="wrap">${unplaced.map(chip)}</div>` : nothing}
-      ${placed.length ? html`<div class="section">On the map (pick to move)</div><div class="wrap">${placed.map(chip)}</div>` : nothing}
-      <div class="arrange-actions">
-        <button class="btn primary" ?disabled=${!dirty} @click=${() => this._save()}>Save</button>
-        <button class="btn" @click=${() => this._showYaml()}>Copy as YAML</button>
-        <button class="btn" @click=${() => {
-          this._draft = undefined;
-          this._placing = undefined;
-        }} ?disabled=${!dirty}>Discard</button>
-        <button class="btn" ?disabled=${!this._saved} @click=${() => this._reset()}>Reset to YAML</button>
+      ${sel && selState
+        ? html`<div class="selected-row">
+            <span class="sel-icon"><ha-state-icon .hass=${this.hass} .stateObj=${selState}></ha-state-icon></span>
+            <span class="sel-text"><b>${sel.name}</b>${sel.room ? html`<span>${sel.room}</span>` : nothing}</span>
+            <button class="btn" @click=${() => this._remove(sel.id)}>Remove</button>
+          </div>`
+        : html`<div class="hint">Drag each device to where it really is. Tap one to see its name.</div>`}
+      ${unplaced.length
+        ? html`<div class="section">Add to the map</div>
+            ${[...byRoom].map(
+              ([room, items]) => html`<div class="add-group">
+                <div class="add-room">${room}</div>
+                <div class="wrap">
+                  ${items.map(
+                    (p) => html`<button class="pill" @click=${() => this._add(p)}><ha-icon icon="mdi:plus"></ha-icon>${p.name}</button>`,
+                  )}
+                </div>
+              </div>`,
+            )}`
+        : nothing}
+      <div class="arrange-more">
+        <button class="link" @click=${() => this._showYaml()}>Copy positions for the dashboard YAML</button>
+        ${this._saved ? html`<button class="link danger" @click=${() => this._reset()}>Reset to defaults</button>` : nothing}
       </div>
       ${this._yaml
         ? html`<textarea class="yaml" readonly rows="8" .value=${this._yaml} @focus=${(e: Event) => (e.target as HTMLTextAreaElement).select()}></textarea>
-            <div class="hint">Paste into the card's config to keep these positions in git. Saved positions win over YAML until you reset.</div>`
+            <div class="hint">Copied. Paste it into the card config to keep these positions in git.</div>`
         : nothing}
     </div>`;
   }
@@ -851,10 +928,6 @@ export class FloorPlanCard extends LitElement {
       stroke: var(--fp-accent);
       stroke-width: 6;
     }
-    .placing .room,
-    .placing svg {
-      cursor: crosshair;
-    }
     .dot {
       fill: none;
       stroke: var(--secondary-text-color);
@@ -866,12 +939,6 @@ export class FloorPlanCard extends LitElement {
     }
     .dot.na {
       stroke-dasharray: 4 4;
-    }
-    .dot.drag {
-      pointer-events: all;
-      cursor: grab;
-      stroke: var(--fp-accent);
-      stroke-width: 4;
     }
     .overlay {
       position: absolute;
@@ -918,10 +985,133 @@ export class FloorPlanCard extends LitElement {
       background: var(--success-color, #34c759);
       color: #fff;
     }
-    .icon.drag {
+    .arranging .label {
+      opacity: 0.35;
+    }
+    .arranging .room {
+      cursor: default;
+    }
+    .handle {
+      position: absolute;
+      transform: translate(-50%, -50%);
+      width: 30px;
+      height: 30px;
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      background: var(--fp-bg);
+      color: var(--primary-text-color);
+      box-shadow: 0 0 0 2px var(--ring, var(--secondary-text-color)), 0 2px 6px rgba(0, 0, 0, 0.35);
+      --mdc-icon-size: 17px;
       pointer-events: all;
       cursor: grab;
-      box-shadow: 0 0 0 2px var(--fp-accent);
+      touch-action: none;
+      transition: transform 120ms ease;
+    }
+    /* 44px touch target around the 30px handle. */
+    .handle::before {
+      content: "";
+      position: absolute;
+      inset: -7px;
+      border-radius: 50%;
+    }
+    .handle.selected {
+      z-index: 2;
+      box-shadow: 0 0 0 3px var(--fp-accent), 0 2px 8px rgba(0, 0, 0, 0.4);
+    }
+    .handle.dragging {
+      cursor: grabbing;
+      transform: translate(-50%, -50%) scale(1.2);
+    }
+    .tag {
+      position: absolute;
+      bottom: calc(100% + 8px);
+      left: 50%;
+      transform: translateX(-50%);
+      padding: 4px 9px;
+      border-radius: 8px;
+      background: var(--primary-text-color);
+      color: var(--fp-bg);
+      font-size: 12px;
+      font-weight: 600;
+      white-space: nowrap;
+      pointer-events: none;
+    }
+    .tag.below {
+      bottom: auto;
+      top: calc(100% + 8px);
+    }
+    /* While dragging, lift the name clear of the finger. */
+    .handle.dragging .tag:not(.below) {
+      bottom: calc(100% + 30px);
+    }
+    .arrange-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .arrange-title {
+      font-size: 16px;
+      font-weight: 600;
+    }
+    .selected-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 8px 8px 10px;
+      border-radius: 14px;
+      background: var(--fp-surface);
+    }
+    .sel-icon {
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      background: var(--fp-bg);
+      --mdc-icon-size: 18px;
+    }
+    .sel-text {
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      font-size: 14px;
+    }
+    .sel-text span {
+      font-size: 12px;
+      color: var(--secondary-text-color);
+    }
+    .add-group {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .add-room {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--secondary-text-color);
+    }
+    .pill ha-icon {
+      --mdc-icon-size: 16px;
+      margin-left: -4px;
+    }
+    .arrange-more {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px 16px;
+      margin-top: 4px;
+    }
+    .link {
+      padding: 6px 0;
+      font-size: 13px;
+      color: var(--secondary-text-color);
+      text-decoration: underline;
+      text-underline-offset: 2px;
+    }
+    .link.danger {
+      color: var(--error-color, #ff453a);
     }
     .arrange-btn {
       position: absolute;
@@ -936,11 +1126,6 @@ export class FloorPlanCard extends LitElement {
       place-items: center;
       --mdc-icon-size: 18px;
       opacity: 0.8;
-    }
-    .arranging .arrange-btn {
-      background: var(--fp-accent);
-      color: #1c1c1e;
-      opacity: 1;
     }
     .pills,
     .chips.scroll {
@@ -994,12 +1179,6 @@ export class FloorPlanCard extends LitElement {
       display: flex;
       flex-wrap: wrap;
       gap: 6px;
-    }
-    .arrange-actions {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      margin-top: 4px;
     }
     .btn {
       height: 36px;
@@ -1251,8 +1430,9 @@ export class FloorPlanCard extends LitElement {
     h3 + .grid {
       margin-top: 0;
     }
+    /* The tile sets its own min-height; a fixed height here made it overflow into the next row. */
     .grid dg-light-tile {
-      height: 104px;
+      display: block;
     }
     .tile {
       display: flex;
