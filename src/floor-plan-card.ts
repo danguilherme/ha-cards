@@ -939,6 +939,8 @@ export class FloorPlanCard extends LitElement {
       display: flex;
       flex-direction: column;
       gap: 14px;
+      /* Zooming into a room scrolls the card into view: keep its top clear of HA's sticky header. */
+      scroll-margin-top: calc(var(--header-height, 56px) + env(safe-area-inset-top, 0px) + 8px);
     }
     button {
       font: inherit;
