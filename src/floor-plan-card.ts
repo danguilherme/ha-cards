@@ -88,6 +88,7 @@ export class FloorPlanCard extends LitElement {
     _placing: { state: true },
     _yaml: { state: true },
     _dragging: { state: true },
+    _pressing: { state: true },
   };
 
   declare hass?: HomeAssistant;
@@ -99,6 +100,7 @@ export class FloorPlanCard extends LitElement {
   private declare _placing?: string;
   private declare _yaml?: string;
   private declare _dragging?: string;
+  private declare _pressing?: string;
 
   private _loadedLayout = false;
   private _hold?: { timer: number; fired: boolean };
@@ -267,22 +269,31 @@ export class FloorPlanCard extends LitElement {
     const timer = window.setTimeout(() => {
       if (!this._hold) return;
       this._hold.fired = true;
-      if (room.light) this._call("light", "toggle", { entity_id: room.light });
+      this._pressing = undefined;
+      if (room.light) {
+        navigator.vibrate?.(15);
+        this._call("light", "toggle", { entity_id: room.light });
+      }
     }, HOLD_MS);
     this._hold = { timer, fired: false };
+    this._pressing = room.area;
   }
 
-  private _roomUp(room: RoomConfig): void {
-    if (this._arrange || !this._hold) return;
-    clearTimeout(this._hold.timer);
-    const fired = this._hold.fired;
-    this._hold = undefined;
-    if (!fired) this._room = room.area;
-  }
-
-  private _roomCancel(): void {
+  // The sheet opens on `click`, not `pointerup`: on touch the compatibility click fires after pointerup
+  // and is hit-tested at the finger, which by then is over the freshly rendered scrim — it would close
+  // the sheet straight away. The hold timer still runs on pointer events.
+  // Up, leave and cancel only stop the timer: on touch, pointerleave fires between pointerup and click,
+  // and the click still needs to know whether the hold fired. pointerdown starts a fresh _hold.
+  private _roomUp(): void {
     if (this._hold) clearTimeout(this._hold.timer);
+    this._pressing = undefined;
+  }
+
+  private _roomClick(room: RoomConfig): void {
+    const held = this._hold?.fired;
     this._hold = undefined;
+    if (this._arrange || held) return;
+    this._room = room.area;
   }
 
   // --- arrange mode -------------------------------------------------------------------------------
@@ -426,16 +437,17 @@ export class FloorPlanCard extends LitElement {
           const pct = this._pct(s);
           const [r, g, b] = this._rgb(s);
           const gid = `glow-${s.entity_id.replace(/\W/g, "_")}`;
-          const a = ((dark ? 0.4 : 0.28) + 0.45 * (pct / 100)).toFixed(2);
+          const a = ((dark ? 0.26 : 0.28) + (dark ? 0.36 : 0.45) * (pct / 100)).toFixed(2);
           defs.push(svg`<radialGradient id=${gid}><stop offset="0" stop-color="rgb(${r},${g},${b})" stop-opacity=${a}></stop><stop offset="1" stop-color="rgb(${r},${g},${b})" stop-opacity="0"></stop></radialGradient>`);
           return svg`<circle cx=${x} cy=${y} r=${(15 + 17 * (pct / 100)) * unit} fill="url(#${gid})"></circle>`;
         });
       glows.push(svg`<g clip-path="url(#room-${i})" pointer-events="none">${roomGlows}</g>`);
-      return svg`<polygon class="room ${this._room === room.area ? "selected" : ""}" points=${points}
+      return svg`<polygon class="room ${this._room === room.area ? "selected" : ""} ${this._pressing === room.area ? "pressing" : ""}" points=${points}
         @pointerdown=${(ev: PointerEvent) => this._roomDown(ev, room)}
-        @pointerup=${() => this._roomUp(room)}
-        @pointerleave=${() => this._roomCancel()}
-        @pointercancel=${() => this._roomCancel()}
+        @pointerup=${() => this._roomUp()}
+        @click=${() => this._roomClick(room)}
+        @pointerleave=${() => this._roomUp()}
+        @pointercancel=${() => this._roomUp()}
         @contextmenu=${(ev: Event) => ev.preventDefault()}></polygon>`;
     });
 
@@ -471,7 +483,7 @@ export class FloorPlanCard extends LitElement {
       const [x, y] = room.label ?? this._centroid(room.shape);
       const e = this._roomEntities(room);
       const on = e.lights.filter((s) => s.state === "on").length;
-      const sub = [on ? `${on} light${on > 1 ? "s" : ""}` : "Off", ...e.media.filter((s) => !isOff(s)).map((s) => `${this._name(s, room)} on`)].join(" · ");
+      const sub = [on ? `${on} on` : "Off", ...e.media.filter((s) => !isOff(s)).map((s) => `${this._name(s, room)} on`)].join(" · ");
       return html`<div class="label" style="left:${(x / w) * 100}%;top:${(y / h) * 100}%">
         <div class="label-name">${this._roomName(room)}</div>
         <div class="label-sub">${sub}</div>
@@ -557,6 +569,16 @@ export class FloorPlanCard extends LitElement {
     const vac = c.vacuum ? hass.states[c.vacuum] : undefined;
     const cleaningHere = !!vac && vac.state === "cleaning" && this._vacuumRoom()?.area === room.area;
     const close = () => (this._room = undefined);
+    const na = (s: HassEntity) => s.state === "unavailable";
+    const media = e.media.filter((s) => !na(s));
+    const devices = e.devices.filter((s) => !na(s));
+    const offline = [...e.media, ...e.devices].filter(na);
+    const lightsOn = e.lights.filter((s) => s.state === "on").length;
+    const headline = [
+      lightsOn ? `${lightsOn} light${lightsOn > 1 ? "s" : ""} on` : "Lights off",
+      ...media.filter((s) => !isOff(s)).map((s) => `${this._name(s, room)} on`),
+      ...(cleaningHere ? ["Cleaning"] : []),
+    ].join(" · ");
     const tileRef = (entity: string, name: string) =>
       ref((el?: Element) => {
         const t = el as (HTMLElement & { setConfig(c: unknown): void; _dgKey?: string }) | undefined;
@@ -570,7 +592,10 @@ export class FloorPlanCard extends LitElement {
       <div class="sheet" role="dialog" aria-label=${this._roomName(room)} @keydown=${(ev: KeyboardEvent) => ev.key === "Escape" && close()}>
         <div class="grabber"></div>
         <div class="sheet-head">
-          <h2>${this._roomName(room)}</h2>
+          <div>
+            <h2>${this._roomName(room)}</h2>
+            <div class="headline">${headline}</div>
+          </div>
           <button class="round" aria-label="Close" @click=${close}><ha-icon icon="mdi:close"></ha-icon></button>
         </div>
         ${e.chips.length
@@ -583,21 +608,6 @@ export class FloorPlanCard extends LitElement {
             </div>`
           : nothing}
 
-        ${vac
-          ? html`<div class="row card">
-              <span class="row-icon ${vac.state === "cleaning" ? "green" : ""}"><ha-state-icon .hass=${hass} .stateObj=${vac}></ha-state-icon></span>
-              <span class="row-text">
-                <span class="row-name">${this._name(vac)}</span>
-                <span class="row-sub">${room.clean ? (cleaningHere ? `Cleaning ${this._roomName(room).toLowerCase()}` : this._state(vac)) : "This room isn't on the map"}</span>
-              </span>
-              ${room.clean
-                ? cleaningHere
-                  ? html`<button class="btn" @click=${() => this._call("vacuum", "return_to_base", { entity_id: vac.entity_id })}>Stop</button>`
-                  : html`<button class="btn primary" @click=${() => this._call("vacuum", "clean_area", { entity_id: vac.entity_id, cleaning_area_id: [room.area] })}>Clean this room</button>`
-                : nothing}
-            </div>`
-          : nothing}
-
         ${group || e.lights.length
           ? html`<h3>Lights</h3>
               ${group
@@ -607,7 +617,7 @@ export class FloorPlanCard extends LitElement {
                     </button>
                     <span class="row-text">
                       <span class="row-line"><span class="row-name">All lights</span><span class="row-sub">${groupPct ? `${groupPct}%` : "Off"}</span></span>
-                      <input type="range" min="1" max="100" .value=${String(groupPct || 50)} aria-label="Room brightness"
+                      <input type="range" min="1" max="100" .value=${String(groupPct)} aria-label="Room brightness"
                         @change=${(ev: Event) => this._call("light", "turn_on", { entity_id: group.entity_id, brightness_pct: Number((ev.target as HTMLInputElement).value) })} />
                     </span>
                   </div>`
@@ -624,13 +634,28 @@ export class FloorPlanCard extends LitElement {
               </div>`
           : nothing}
 
-        ${e.media.length
+        ${vac
+          ? html`<h3>Cleaning</h3>
+            <div class="row card">
+              <span class="row-icon ${vac.state === "cleaning" ? "green" : ""}"><ha-state-icon .hass=${hass} .stateObj=${vac}></ha-state-icon></span>
+              <span class="row-text">
+                <span class="row-name">${this._name(vac)}</span>
+                <span class="row-sub">${room.clean ? (cleaningHere ? `Cleaning ${this._roomName(room).toLowerCase()}` : this._state(vac)) : "This room isn't on the map"}</span>
+              </span>
+              ${room.clean
+                ? cleaningHere
+                  ? html`<button class="btn" @click=${() => this._call("vacuum", "return_to_base", { entity_id: vac.entity_id })}>Stop</button>`
+                  : html`<button class="btn primary" @click=${() => this._call("vacuum", "clean_area", { entity_id: vac.entity_id, cleaning_area_id: [room.area] })}>Clean this room</button>`
+                : nothing}
+            </div>`
+          : nothing}
+
+        ${media.length
           ? html`<h3>Media</h3>
               <div class="list">
-                ${e.media.map((s) => {
-                  const na = s.state === "unavailable";
+                ${media.map((s) => {
                   const title = s.attributes.media_title ?? s.attributes.app_name ?? s.attributes.source;
-                  return html`<div class="row card ${na ? "na" : ""} ${!isOff(s) ? "media-on" : ""}">
+                  return html`<div class="row card ${!isOff(s) ? "media-on" : ""}">
                     <button class="row-main" @click=${() => fireMoreInfo(this, s.entity_id)}>
                       <span class="row-icon"><ha-state-icon .hass=${hass} .stateObj=${s}></ha-state-icon></span>
                       <span class="row-text">
@@ -638,27 +663,24 @@ export class FloorPlanCard extends LitElement {
                         <span class="row-sub">${this._state(s)}${title && !isOff(s) ? ` · ${title}` : ""}</span>
                       </span>
                     </button>
-                    ${!na && (s.state === "playing" || s.state === "paused")
+                    ${s.state === "playing" || s.state === "paused"
                       ? html`<button class="round" aria-label="Play or pause" @click=${() => this._call("media_player", "media_play_pause", { entity_id: s.entity_id })}>
                           <ha-icon icon=${s.state === "playing" ? "mdi:pause" : "mdi:play"}></ha-icon>
                         </button>`
                       : nothing}
-                    ${!na
-                      ? html`<button class="round" aria-label="Power" @click=${() => this._call("media_player", "toggle", { entity_id: s.entity_id })}>
-                          <ha-icon icon="mdi:power"></ha-icon>
-                        </button>`
-                      : nothing}
+                    <button class="round" aria-label="Power" @click=${() => this._call("media_player", "toggle", { entity_id: s.entity_id })}>
+                      <ha-icon icon="mdi:power"></ha-icon>
+                    </button>
                   </div>`;
                 })}
               </div>`
           : nothing}
 
-        ${e.devices.length
+        ${devices.length
           ? html`<h3>Devices</h3>
               <div class="grid">
-                ${e.devices.map((s) => {
-                  const na = s.state === "unavailable";
-                  return html`<button class="tile ${!isOff(s) ? "on" : ""} ${na ? "na" : ""}"
+                ${devices.map((s) => {
+                  return html`<button class="tile ${!isOff(s) ? "on" : ""}"
                     @click=${() => this._toggleEntity(s)}
                     @contextmenu=${(ev: Event) => {
                       ev.preventDefault();
@@ -670,6 +692,19 @@ export class FloorPlanCard extends LitElement {
                 })}
               </div>`
           : nothing}
+
+        ${offline.length
+          ? html`<details class="offline">
+              <summary>Unavailable (${offline.length})</summary>
+              <div class="offline-list">
+                ${offline.map(
+                  (s) => html`<button class="offline-item" @click=${() => fireMoreInfo(this, s.entity_id)}>
+                    <ha-state-icon .hass=${hass} .stateObj=${s}></ha-state-icon>${this._name(s, room)}
+                  </button>`,
+                )}
+              </div>
+            </details>`
+          : nothing}
       </div>`;
   }
 
@@ -677,7 +712,7 @@ export class FloorPlanCard extends LitElement {
     :host {
       display: block;
       --fp-bg: var(--ha-card-background, var(--card-background-color, #fff));
-      --fp-surface: var(--secondary-background-color, #e5e5ea);
+      --fp-surface: color-mix(in srgb, var(--primary-text-color, #1c1c1e) 9%, transparent);
       --fp-accent: var(--primary-color, #ff9f0a);
     }
     ha-card {
@@ -770,6 +805,10 @@ export class FloorPlanCard extends LitElement {
       cursor: pointer;
       -webkit-tap-highlight-color: transparent;
     }
+    .room.pressing {
+      fill: color-mix(in srgb, var(--fp-accent) 22%, var(--fp-bg));
+      transition: fill 450ms ease;
+    }
     .room.selected {
       stroke: var(--fp-accent);
       stroke-width: 6;
@@ -806,6 +845,9 @@ export class FloorPlanCard extends LitElement {
       transform: translate(-50%, -50%);
       text-align: center;
       white-space: nowrap;
+    }
+    .label {
+      text-shadow: 0 0 2px var(--fp-bg), 0 0 6px var(--fp-bg), 0 0 10px var(--fp-bg);
     }
     .label-name {
       font-size: 13px;
@@ -1004,6 +1046,36 @@ export class FloorPlanCard extends LitElement {
       font-size: 22px;
       font-weight: 600;
       letter-spacing: -0.4px;
+    }
+    .headline {
+      font-size: 13px;
+      color: var(--secondary-text-color);
+      margin-top: 2px;
+    }
+    details.offline {
+      margin-top: 18px;
+      font-size: 13px;
+      color: var(--secondary-text-color);
+    }
+    details.offline summary {
+      cursor: pointer;
+      padding: 6px 0;
+    }
+    .offline-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      padding-top: 6px;
+    }
+    .offline-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: var(--fp-surface);
+      --mdc-icon-size: 16px;
+      opacity: 0.7;
     }
     h3 {
       margin: 18px 0 8px;
